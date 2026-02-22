@@ -1,46 +1,65 @@
 /**
- * Weapon Inspector - Final Edition
+ * Weapon Inspector
  *
- * Adds a server-side “inspect weapon” feature for Counter-Strike 1.6.
+ * Simple tut ( install / use )
+ * ----------------------------------------------------------------------------
+ * 1) Compile and add to plugins.ini:
+ *      weapon_inspector.amxx
  *
- * Core idea:
- * - The plugin reads the player's current viewmodel (.mdl) and finds inspect/idle sequences
- *   by keyword matching (case-insensitive).
- * - If the model does NOT have inspect sequences, the plugin will not run any extra logic
- *   for that model (analysis is cached per model path).
- * - Natural idle philosophy:
- *   Instead of forcing/replaying idle animations every tick, the plugin simply extends
- *   m_flTimeWeaponIdle to prevent the engine from interrupting inspect. When inspect ends,
- *   the engine resumes its normal idle cycle naturally.
+ * 2) Config files ( auto-created in /configs ):
  *
- * Activation system:
- * - Always provides "inspect" command as fallback (players can bind it manually).
- * - Optional impulse activation with cvar:
- *      wi_impulse_mode 0 = disable impulse hook
- *      wi_impulse_mode 1 = impulse 100 (Flashlight / Use-key style)
- *      wi_impulse_mode 2 = impulse 201
- *   Impulses are only intercepted when an inspect actually starts; otherwise default
- *   behavior is not blocked.
+ *    inspect_list.ini
+ *        - Inspect keywords (one per line)
  *
- * Developer support:
- * - Natives:
- *      wi_is_inspecting( id )
- *      wi_force_inspect( id )                 // tries to start inspect ignoring rate/cooldown (still safe)
- *      wi_block_inspect( id, Float:duration ) // block inspect temporarily (minigames/events)
- *      Float:wi_get_inspect_timeleft( id )    // remaining time if inspecting
+ *    weapon_inspector_models.ini
+ *        - Per-model overrides:
  *
- * - Forwards:
- *      wi_inspect_start_pre( id, weapon, seq )  // can block by returning PLUGIN_HANDLED / higher
- *      wi_inspect_start( id, weapon, seq )
- *      wi_inspect_end( id )
+ *            AUTO_INSPECT    = 0/1
+ *            MANUAL_INSPECT  = 0/1
+ *            IDLE_LOOP_TIME  = float
+ *            IDLE_SEQ_FORCE  = int
  *
- * Admin tools:
- * - wi_status
- * - wi_reload_config
- * - wi_debug <player>   (prints model, seq pools, cooldown/busy/blocked, inspecting, etc.)
+ * 3) Command:
  *
- * No ReAPI dependency. Uses Ham Sandwich + FakeMeta (+ CStrike for zoom/silencer).
+ *        bind "f" "inspect"
+ *
+ * 4) Optional impulse activation:
+ *
+ *        wi_impulse_mode 0/1/2
+ *
+ *
+ * ========================================================================
+ * Changelog
+ * ========================================================================
+ *
+ * v1.0.0 — Initial Release
+ * ----------------------------------------------------------------------------
+ *
+ * - Server-side inspect system
+ * - Automatic inspect detection from model sequences
+ * - Real animation duration calculation
+ * - Cooldown and anti-spam protection
+ * - Safe cancellation on attack, reload, deploy, zoom
+ * - Silencer-aware support (USP / M4A1)
+ * - Developer API (natives and forwards)
+ * - Admin debug and status tools
+ *
+ *
+ * v1.1.0 — Per-Model Rules Update
+ * ----------------------------------------------------------------------------
+ *
+ * - Added per-model rules system (weapon_inspector_models.ini)
+ * - Added AUTO_INSPECT and MANUAL_INSPECT controls
+ * - Added controlled idle-loop system
+ * - Added forced idle sequence support
+ * - Improved idle-loop safety and engine compatibility
+ * - Fixed shotgun reload compatibility (M3 / XM1014)
+ *
+ *
+ * ========================================================================
  */
+
+#pragma semicolon 1
 
 #include <amxmodx>
 #include <amxmisc>
@@ -48,13 +67,11 @@
 #include <fakemeta>
 #include <hamsandwich>
 
-#pragma semicolon 1
-
 // ========================================================================
 //  PLUGIN INFO
 // ========================================================================
 new const PLUGIN_NAME[ ]    = "Weapon Inspector";
-new const PLUGIN_VERSION[ ] = "1.0.0";
+new const PLUGIN_VERSION[ ] = "1.1.0";
 new const PLUGIN_AUTHOR[ ]  = "SkyLiN3";
 
 // ========================================================================
@@ -87,6 +104,11 @@ const m_pActiveItem           = 373;
 #define MAX_MODEL_SIZE        5242880
 
 #define IDLE_BLOCK_PAD        0.20
+
+#define RULE_DEFAULT_AUTO            1
+#define RULE_DEFAULT_MANUAL          1
+#define RULE_DEFAULT_LOOP            0.0
+#define RULE_DEFAULT_IDLE_SEQ_FORCE  -1
 
 // Weapons that cannot be inspected
 const WPNS_NO_INSPECT = ( 1 << CSW_C4 )
@@ -179,6 +201,15 @@ new Trie:g_tIdleGeneric;
 new Trie:g_tModelValidated;
 new Trie:g_tModelAnalyzed;
 new Trie:g_tModelSupportsInspect;
+new Trie:g_tModelNumSeq;            // cache: model -> numseq
+
+// ========================================================================
+//  GLOBALS - Per-Model Rules (INI)
+// ========================================================================
+new Trie:g_tRuleAutoInspect;        // cell 0/1
+new Trie:g_tRuleManualInspect;      // cell 0/1
+new Trie:g_tRuleIdleLoopTime;       // cell floatbits
+new Trie:g_tRuleIdleSeqForce;       // cell int
 
 // ========================================================================
 //  GLOBALS - Player State
@@ -190,6 +221,9 @@ new Float:g_fInspectEnd[ MAX_PLAYERS + 1 ];
 new Float:g_fCooldownUntil[ MAX_PLAYERS + 1 ];
 new Float:g_fBusyUntil[ MAX_PLAYERS + 1 ];
 new Float:g_fBlockedUntil[ MAX_PLAYERS + 1 ];
+
+// Idle-loop throttle
+new Float:g_fNextIdleLoop[ MAX_PLAYERS + 1 ];
 
 // Track last viewmodel per player to detect weapon switches
 new g_szLastViewModel[ MAX_PLAYERS + 1 ][ MODEL_PATH_LEN ];
@@ -266,10 +300,20 @@ public plugin_init( )
     g_tModelValidated       = TrieCreate( );
     g_tModelAnalyzed        = TrieCreate( );
     g_tModelSupportsInspect = TrieCreate( );
+    g_tModelNumSeq          = TrieCreate( );
+
+    // Rules
+    g_tRuleAutoInspect      = TrieCreate( );
+    g_tRuleManualInspect    = TrieCreate( );
+    g_tRuleIdleLoopTime     = TrieCreate( );
+    g_tRuleIdleSeqForce     = TrieCreate( );
 
     // Keywords
     g_aInspectKeywords = ArrayCreate( KEYWORD_MAX_LEN, 0 );
     LoadInspectKeywords( );
+
+    // Per-model rules
+    LoadModelRules( );
 
     // Forwards
     g_fwdInspectStartPre = CreateMultiForward( "wi_inspect_start_pre", ET_STOP,   FP_CELL, FP_CELL, FP_CELL );
@@ -310,12 +354,12 @@ public plugin_init( )
     // Commands
     register_concmd( "inspect", "Cmd_Inspect" );
 
-    // PreThink monitors inspect end / interruption
+    // PreThink monitors inspect end / interruption + idle-loop (rules)
     register_forward( FM_PlayerPreThink, "FMHook_PreThink" );
 
     // Admin
     register_concmd( "wi_status",        "Cmd_Status",        ADMIN_RCON, "- Show plugin status" );
-    register_concmd( "wi_reload_config", "Cmd_ReloadConfig",  ADMIN_RCON, "- Reload keywords and clear model cache" );
+    register_concmd( "wi_reload_config", "Cmd_ReloadConfig",  ADMIN_RCON, "- Reload keywords/rules and clear model cache" );
     register_concmd( "wi_debug",         "Cmd_Debug",         ADMIN_RCON, "<player> - Debug info for a player" );
 
     // Events
@@ -358,6 +402,12 @@ public plugin_end( )
     if ( g_tModelValidated       != Invalid_Trie ) TrieDestroy( g_tModelValidated );
     if ( g_tModelAnalyzed        != Invalid_Trie ) TrieDestroy( g_tModelAnalyzed );
     if ( g_tModelSupportsInspect != Invalid_Trie ) TrieDestroy( g_tModelSupportsInspect );
+    if ( g_tModelNumSeq          != Invalid_Trie ) TrieDestroy( g_tModelNumSeq );
+
+    if ( g_tRuleAutoInspect      != Invalid_Trie ) TrieDestroy( g_tRuleAutoInspect );
+    if ( g_tRuleManualInspect    != Invalid_Trie ) TrieDestroy( g_tRuleManualInspect );
+    if ( g_tRuleIdleLoopTime     != Invalid_Trie ) TrieDestroy( g_tRuleIdleLoopTime );
+    if ( g_tRuleIdleSeqForce     != Invalid_Trie ) TrieDestroy( g_tRuleIdleSeqForce );
 
     if ( g_aInspectKeywords      != Invalid_Array ) ArrayDestroy( g_aInspectKeywords );
 }
@@ -481,6 +531,7 @@ public Cmd_Status( id )
     console_print( id, "Impulse mode: %d (0=off, 1=100, 2=201)", get_pcvar_num( g_pCvarImpulseMode ) );
     console_print( id, "Keywords loaded: %d", g_iInspectKeywordCount );
     console_print( id, "Log models: %d", get_pcvar_num( g_pCvarLogModels ) );
+    console_print( id, "Model rules loaded: %d", TrieCountCells( g_tRuleAutoInspect ) );
     console_print( id, "=============================================" );
 
     return PLUGIN_HANDLED;
@@ -491,12 +542,30 @@ public Cmd_ReloadConfig( id )
     ArrayClear( g_aInspectKeywords );
     g_iInspectKeywordCount = 0;
 
+    TrieClear( g_tModelValidated );
     TrieClear( g_tModelAnalyzed );
     TrieClear( g_tModelSupportsInspect );
+    TrieClear( g_tModelNumSeq );
+
+    TrieClear( g_tInspectSilenced );
+    TrieClear( g_tInspectUnsilenced );
+    TrieClear( g_tInspectGeneric );
+    TrieClear( g_tIdleSilenced );
+    TrieClear( g_tIdleUnsilenced );
+    TrieClear( g_tIdleGeneric );
+
+    TrieClear( g_tRuleAutoInspect );
+    TrieClear( g_tRuleManualInspect );
+    TrieClear( g_tRuleIdleLoopTime );
+    TrieClear( g_tRuleIdleSeqForce );
 
     LoadInspectKeywords( );
+    LoadModelRules( );
 
-    console_print( id, "[WI] Config reloaded. %d keyword(s) loaded.", g_iInspectKeywordCount );
+    console_print( id, "[WI] Config reloaded. %d keyword(s). Model rules: %d",
+        g_iInspectKeywordCount,
+        TrieCountCells( g_tRuleAutoInspect ) );
+
     return PLUGIN_HANDLED;
 }
 
@@ -551,6 +620,12 @@ public Cmd_Debug( id, level, cid )
         new iSupport = 0;
         TrieGetCell( g_tModelSupportsInspect, szModel, iSupport );
 
+        new iAuto = GetRuleAutoInspect( szModel );
+        new iManual = GetRuleManualInspect( szModel );
+        new Float:fLoop = GetRuleIdleLoopTime( szModel );
+        new iForce = GetRuleIdleSeqForce( szModel );
+
+        console_print( id, "Rules: AUTO=%d MANUAL=%d LOOP=%.2f IDLE_FORCE=%d", iAuto, iManual, fLoop, iForce );
         console_print( id, "ModelSupportsInspect cached: %d", iSupport );
 
         if ( EnsureModelAnalyzed( szModel ) )
@@ -631,7 +706,7 @@ public client_impulse( id, impulse )
 }
 
 // ========================================================================
-//  CORE - TRY INSPECT
+//  CORE - TRY INSPECT (MANUAL)
 // ========================================================================
 stock bool:WI_TryInspect( const id, const bool:bForced )
 {
@@ -692,7 +767,7 @@ stock bool:WI_TryInspect( const id, const bool:bForced )
         return false;
     }
 
-    // Block during special reload state
+    // Block during special reload state (shotguns)
     if ( get_pdata_int( weapon, m_fInSpecialReload, XO_WEAPON ) )
     {
         return false;
@@ -703,6 +778,20 @@ stock bool:WI_TryInspect( const id, const bool:bForced )
     new Float:flNextPrimary = get_pdata_float( weapon, m_flNextPrimaryAttack,  XO_WEAPON );
 
     if ( flNextAttack > 0.0 || flNextPrimary > 0.0 )
+    {
+        return false;
+    }
+
+    // Model path
+    new szModel[ MODEL_PATH_LEN ];
+
+    if ( !GetPlayerViewModel( id, szModel, charsmax( szModel ) ) )
+    {
+        return false;
+    }
+
+    // Manual inspect rule (unless forced)
+    if ( !bForced && !GetRuleManualInspect( szModel ) )
     {
         return false;
     }
@@ -727,13 +816,6 @@ stock bool:WI_TryInspect( const id, const bool:bForced )
     }
 
     // Model support check (parses model only once per unique path)
-    new szModel[ MODEL_PATH_LEN ];
-
-    if ( !GetPlayerViewModel( id, szModel, charsmax( szModel ) ) )
-    {
-        return false;
-    }
-
     if ( !ModelSupportsInspect( szModel ) )
     {
         return false;
@@ -769,6 +851,9 @@ stock bool:WI_TryInspect( const id, const bool:bForced )
     g_iInspectSeq[ id ] = iSeq;
     g_fInspectEnd[ id ] = get_gametime( ) + fDuration;
 
+    // IMPORTANT: ensure idle-loop never runs during inspect
+    g_fNextIdleLoop[ id ] = 0.0;
+
     // Play inspect
     PlayWeaponAnim( id, iSeq );
 
@@ -792,14 +877,27 @@ public HamHook_PrimaryAttack_Post( weapon )
         return;
     }
 
+    new wpn_id = get_user_weapon( id );
+
+    // Shotgun special reload: NEVER interfere (critical)
+    if ( ( wpn_id == CSW_M3 || wpn_id == CSW_XM1014 )
+        && get_pdata_int( weapon, m_fInSpecialReload, XO_WEAPON ) != 0 )
+    {
+        return;
+    }
+
+    new szModel[ MODEL_PATH_LEN ];
+    if ( !GetPlayerViewModel( id, szModel, charsmax( szModel ) ) || !ModelSupportsInspect( szModel ) )
+    {
+        return;
+    }
+
     if ( g_bInspecting[ id ] )
     {
         CancelInspect( id, false );
         SetCooldown( id, get_gametime( ) + 0.30 );
     }
 
-    // Busy window heuristic
-    new wpn_id = get_user_weapon( id );
     new Float:fBusy;
 
     switch ( wpn_id )
@@ -836,6 +934,20 @@ public HamHook_SecondaryAttack_Post( weapon )
         return;
     }
 
+    new szModel[ MODEL_PATH_LEN ];
+    if ( !GetPlayerViewModel( id, szModel, charsmax( szModel ) ) || !ModelSupportsInspect( szModel ) )
+    {
+        new wpn_id = get_user_weapon( id );
+        if ( WPNS_SCOPED & ( 1 << wpn_id ) )
+        {
+            if ( cs_get_user_zoom( id ) <= CS_SET_NO_ZOOM )
+            {
+                PlayWeaponAnim( id, 0 );
+            }
+        }
+        return;
+    }
+
     new wpn_id = get_user_weapon( id );
 
     if ( WPNS_SCOPED & ( 1 << wpn_id ) )
@@ -867,6 +979,12 @@ public HamHook_Deploy_Post( weapon )
         CancelInspect( id, false );
     }
 
+    new szModel[ MODEL_PATH_LEN ];
+    if ( !GetPlayerViewModel( id, szModel, charsmax( szModel ) ) || !ModelSupportsInspect( szModel ) )
+    {
+        return;
+    }
+
     new Float:fCd = get_pcvar_float( g_pCvarDeployCooldown );
 
     SetCooldown( id, get_gametime( ) + fCd );
@@ -887,7 +1005,18 @@ public HamHook_Reload_Post( weapon )
         CancelInspect( id, false );
     }
 
-    // Engine sets m_flNextAttack during reload
+    new szModel[ MODEL_PATH_LEN ];
+    if ( !GetPlayerViewModel( id, szModel, charsmax( szModel ) ) || !ModelSupportsInspect( szModel ) )
+    {
+        return;
+    }
+
+    // Shotgun special reload: NEVER interfere (fix)
+    if ( get_pdata_int( weapon, m_fInSpecialReload, XO_WEAPON ) != 0 )
+    {
+        return;
+    }
+
     new Float:flNextAttack = get_pdata_float( id, m_flNextAttack, XO_PLAYER );
 
     if ( flNextAttack > 0.0 )
@@ -902,7 +1031,7 @@ public HamHook_Reload_Post( weapon )
 }
 
 // ========================================================================
-//  PRETHINK - Monitor inspect end / interruption
+//  PRETHINK - Monitor inspect end / interruption + MODEL AUTO idle-loop
 // ========================================================================
 public FMHook_PreThink( id )
 {
@@ -911,59 +1040,196 @@ public FMHook_PreThink( id )
         return FMRES_IGNORED;
     }
 
-    if ( !g_bInspecting[ id ] )
+    // ------------------------------------------------------------
+    // While inspecting: NEVER run idle-loop.
+    // ------------------------------------------------------------
+    if ( g_bInspecting[ id ] )
     {
-        return FMRES_IGNORED;
-    }
+        // Cancel if player attacks
+        new buttons = pev( id, pev_button );
 
-    // Cancel if player attacks
-    new buttons = pev( id, pev_button );
-
-    if ( buttons & ( IN_ATTACK | IN_ATTACK2 ) )
-    {
-        CancelInspect( id, false );
-        SetCooldown( id, get_gametime( ) + 0.30 );
-        return FMRES_IGNORED;
-    }
-
-    // Cancel if weapon changed (viewmodel changed)
-    new szModel[ MODEL_PATH_LEN ];
-
-    if ( GetPlayerViewModel( id, szModel, charsmax( szModel ) ) )
-    {
-        if ( !equal( szModel, g_szLastViewModel[ id ] ) )
+        if ( buttons & ( IN_ATTACK | IN_ATTACK2 ) )
         {
             CancelInspect( id, false );
-            return FMRES_IGNORED;
-        }
-    }
-
-    // Cancel if weapon entered reload
-    new weapon = get_pdata_cbase( id, m_pActiveItem, XO_PLAYER );
-
-    if ( pev_valid( weapon ) )
-    {
-        if ( get_pdata_int( weapon, m_fInSpecialReload, XO_WEAPON ) )
-        {
-            CancelInspect( id, false );
+            SetCooldown( id, get_gametime( ) + 0.30 );
             return FMRES_IGNORED;
         }
 
-        // Keep idle blocked while inspecting
-        if ( get_gametime( ) < g_fInspectEnd[ id ] )
+        // Cancel if weapon changed (viewmodel changed)
+        new szModel[ MODEL_PATH_LEN ];
+
+        if ( GetPlayerViewModel( id, szModel, charsmax( szModel ) ) )
         {
-            BlockWeaponIdle( id, weapon, g_fInspectEnd[ id ] + IDLE_BLOCK_PAD );
+            if ( !equal( szModel, g_szLastViewModel[ id ] ) )
+            {
+                CancelInspect( id, false );
+                return FMRES_IGNORED;
+            }
+        }
+
+        // Cancel if weapon entered reload (shotguns)
+        new weapon = get_pdata_cbase( id, m_pActiveItem, XO_PLAYER );
+
+        if ( pev_valid( weapon ) )
+        {
+            if ( get_pdata_int( weapon, m_fInSpecialReload, XO_WEAPON ) )
+            {
+                CancelInspect( id, false );
+                return FMRES_IGNORED;
+            }
+
+            // Keep idle blocked while inspecting
+            if ( get_gametime( ) < g_fInspectEnd[ id ] )
+            {
+                BlockWeaponIdle( id, weapon, g_fInspectEnd[ id ] + IDLE_BLOCK_PAD );
+            }
+            else
+            {
+                CancelInspect( id, true );
+            }
         }
         else
         {
-            // Finished naturally
-            CancelInspect( id, true );
+            CancelInspect( id, false );
+        }
+
+        return FMRES_IGNORED;
+    }
+
+    // ------------------------------------------------------------
+    // Not inspecting: apply per-model AUTO idle-loop if configured.
+    // ------------------------------------------------------------
+    if ( !get_pcvar_num( g_pCvarEnabled ) )
+    {
+        return FMRES_IGNORED;
+    }
+
+    new szModel[ MODEL_PATH_LEN ];
+    if ( !GetPlayerViewModel( id, szModel, charsmax( szModel ) ) )
+    {
+        return FMRES_IGNORED;
+    }
+
+    // Only meaningful for models that have inspect support (cached logic)
+    if ( !ModelSupportsInspect( szModel ) )
+    {
+        return FMRES_IGNORED;
+    }
+
+    // AUTO_INSPECT = 1 => do nothing (allow model's normal idle)
+    if ( GetRuleAutoInspect( szModel ) != 0 )
+    {
+        return FMRES_IGNORED;
+    }
+
+    new Float:fLoopTime = GetRuleIdleLoopTime( szModel );
+
+    // If loop time is not configured, we do not attempt hacks.
+    if ( fLoopTime <= 0.0 )
+    {
+        return FMRES_IGNORED;
+    }
+
+    // Do not interfere while busy / blocked / scoped / attacking / reloading
+    if ( get_gametime( ) < g_fBusyUntil[ id ] )
+    {
+        return FMRES_IGNORED;
+    }
+
+    if ( get_gametime( ) < g_fBlockedUntil[ id ] )
+    {
+        return FMRES_IGNORED;
+    }
+
+    if ( cs_get_user_zoom( id ) > CS_SET_NO_ZOOM )
+    {
+        return FMRES_IGNORED;
+    }
+
+    new buttons = pev( id, pev_button );
+    if ( buttons & ( IN_ATTACK | IN_ATTACK2 ) )
+    {
+        return FMRES_IGNORED;
+    }
+
+    new weapon = get_pdata_cbase( id, m_pActiveItem, XO_PLAYER );
+    if ( !pev_valid( weapon ) )
+    {
+        return FMRES_IGNORED;
+    }
+
+    // Shotgun special reload: NEVER interfere (fix)
+    if ( get_pdata_int( weapon, m_fInSpecialReload, XO_WEAPON ) )
+    {
+        return FMRES_IGNORED;
+    }
+
+    if ( get_pdata_float( id, m_flNextAttack, XO_PLAYER ) > 0.0 )
+    {
+        return FMRES_IGNORED;
+    }
+
+    new Float:gt = get_gametime( );
+
+    if ( gt < g_fNextIdleLoop[ id ] )
+    {
+        return FMRES_IGNORED;
+    }
+
+    new iIdleSeq = -1;
+    new Float:fIdleDur = 0.0;
+
+    // Optional forced idle sequence per model
+    new iForced = GetRuleIdleSeqForce( szModel );
+
+    if ( iForced >= 0 )
+    {
+        // Validate against model seq count (cached)
+        new iNumSeq = GetModelNumSeqCached( szModel );
+
+        if ( iNumSeq > 0 && iForced < iNumSeq )
+        {
+            iIdleSeq = iForced;
+        }
+        else
+        {
+            // bad force value -> ignore hack for safety
+            return FMRES_IGNORED;
         }
     }
     else
     {
-        CancelInspect( id, false );
+        if ( !GetIdleSequenceAndDuration( id, weapon, iIdleSeq, fIdleDur ) )
+        {
+            return FMRES_IGNORED;
+        }
     }
+
+    if ( iIdleSeq < 0 )
+    {
+        return FMRES_IGNORED;
+    }
+
+    if ( fLoopTime < 0.05 )
+    {
+        fLoopTime = 0.05;
+    }
+
+    // Force a controlled idle loop to prevent reaching baked "inspect" section.
+    // IMPORTANT: To actually "restart" visually, reset the viewmodel entity cycle.
+    new iVm = pev( id, pev_viewmodel );
+
+    if ( pev_valid( iVm ) )
+    {
+        set_pev( iVm, pev_frame, 0.0 );
+        set_pev( iVm, pev_animtime, gt );
+        set_pev( iVm, pev_framerate, 1.0 );
+    }
+
+    PlayWeaponAnim( id, iIdleSeq );
+
+    set_pdata_float( weapon, m_flTimeWeaponIdle, gt + fLoopTime, XO_WEAPON );
+    g_fNextIdleLoop[ id ] = gt + fLoopTime;
 
     return FMRES_IGNORED;
 }
@@ -985,6 +1251,8 @@ stock ResetPlayerState( const id )
     g_iInspectCount[ id ]      = 0;
     g_fLastInspectReset[ id ]  = 0.0;
 
+    g_fNextIdleLoop[ id ]      = 0.0;
+
     g_szLastViewModel[ id ][ 0 ] = EOS;
     g_iInspectSeq[ id ]          = -1;
     g_fInspectEnd[ id ]          = 0.0;
@@ -998,31 +1266,53 @@ stock CancelInspect( const id, bool:bPlayIdle = true )
     g_iInspectSeq[ id ] = -1;
     g_fInspectEnd[ id ] = 0.0;
 
+    // ensure idle-loop won't collide right after inspect ends
+    g_fNextIdleLoop[ id ] = 0.0;
+
     if ( bPlayIdle && bWasInspecting && is_user_alive( id ) )
     {
         new weapon = get_pdata_cbase( id, m_pActiveItem, XO_PLAYER );
 
         if ( pev_valid( weapon ) )
         {
-            new iIdleSeq;
-            new Float:fIdleDur;
+            new iIdleSeq = -1;
+            new Float:fIdleDur = 0.0;
 
-            if ( GetIdleSequenceAndDuration( id, weapon, iIdleSeq, fIdleDur ) )
+            // If model has forced idle seq, prefer it here too (optional)
+            new szModel[ MODEL_PATH_LEN ];
+            if ( GetPlayerViewModel( id, szModel, charsmax( szModel ) ) )
             {
-                PlayWeaponAnim( id, iIdleSeq );
+                new iForced = GetRuleIdleSeqForce( szModel );
 
-                if ( fIdleDur < 0.10 )
+                if ( iForced >= 0 )
                 {
+                    new iNumSeq = GetModelNumSeqCached( szModel );
+
+                    if ( iNumSeq > 0 && iForced < iNumSeq )
+                    {
+                        iIdleSeq = iForced;
+                        fIdleDur = 3.0;
+                    }
+                }
+            }
+
+            if ( iIdleSeq < 0 )
+            {
+                if ( !GetIdleSequenceAndDuration( id, weapon, iIdleSeq, fIdleDur ) )
+                {
+                    iIdleSeq = 0;
                     fIdleDur = 3.0;
                 }
+            }
 
-                set_pdata_float( weapon, m_flTimeWeaponIdle, get_gametime( ) + fIdleDur, XO_WEAPON );
-            }
-            else
+            PlayWeaponAnim( id, iIdleSeq );
+
+            if ( fIdleDur < 0.10 )
             {
-                PlayWeaponAnim( id, 0 );
-                set_pdata_float( weapon, m_flTimeWeaponIdle, get_gametime( ) + 3.0, XO_WEAPON );
+                fIdleDur = 3.0;
             }
+
+            set_pdata_float( weapon, m_flTimeWeaponIdle, get_gametime( ) + fIdleDur, XO_WEAPON );
         }
     }
 
@@ -1096,6 +1386,49 @@ stock bool:GetPlayerViewModel( const id, szModel[ ], const iLen )
 }
 
 // ========================================================================
+//  RULES - GETTERS (defaults if no entry)
+// ========================================================================
+stock GetRuleAutoInspect( const szModel[ ] )
+{
+    new v;
+    if ( TrieGetCell( g_tRuleAutoInspect, szModel, v ) )
+    {
+        return v;
+    }
+    return RULE_DEFAULT_AUTO;
+}
+
+stock GetRuleManualInspect( const szModel[ ] )
+{
+    new v;
+    if ( TrieGetCell( g_tRuleManualInspect, szModel, v ) )
+    {
+        return v;
+    }
+    return RULE_DEFAULT_MANUAL;
+}
+
+stock Float:GetRuleIdleLoopTime( const szModel[ ] )
+{
+    new bits;
+    if ( TrieGetCell( g_tRuleIdleLoopTime, szModel, bits ) )
+    {
+        return Float:bits;
+    }
+    return RULE_DEFAULT_LOOP;
+}
+
+stock GetRuleIdleSeqForce( const szModel[ ] )
+{
+    new v;
+    if ( TrieGetCell( g_tRuleIdleSeqForce, szModel, v ) )
+    {
+        return v;
+    }
+    return RULE_DEFAULT_IDLE_SEQ_FORCE;
+}
+
+// ========================================================================
 //  MODEL SUPPORT CHECK
 // ========================================================================
 stock bool:ModelSupportsInspect( const szModel[ ] )
@@ -1107,7 +1440,6 @@ stock bool:ModelSupportsInspect( const szModel[ ] )
         return ( iSupport != 0 );
     }
 
-    // First time: validate + analyze once
     if ( !ValidateModelFile( szModel ) )
     {
         TrieSetCell( g_tModelSupportsInspect, szModel, 0 );
@@ -1738,6 +2070,62 @@ stock PickBestFrames( const a, const b )
     return 0;
 }
 
+stock GetModelNumSeqCached( const szModel[ ] )
+{
+    new v;
+
+    if ( TrieGetCell( g_tModelNumSeq, szModel, v ) )
+    {
+        return v;
+    }
+
+    new iNum = 0;
+
+    if ( GetModelNumSeq( szModel, iNum ) )
+    {
+        TrieSetCell( g_tModelNumSeq, szModel, iNum );
+        return iNum;
+    }
+
+    TrieSetCell( g_tModelNumSeq, szModel, 0 );
+    return 0;
+}
+
+stock bool:GetModelNumSeq( const szModel[ ], &iNumSeq )
+{
+    iNumSeq = 0;
+
+    if ( !ValidateModelFile( szModel ) )
+    {
+        return false;
+    }
+
+    new f = fopen( szModel, "rb" );
+
+    if ( !f )
+    {
+        return false;
+    }
+
+    const STUDIOHEADER_NUMSEQ = 164;
+
+    new iSeqCount, iSeqIndex;
+
+    fseek( f, STUDIOHEADER_NUMSEQ, SEEK_SET );
+    fread( f, iSeqCount, BLOCK_INT );
+    fread( f, iSeqIndex, BLOCK_INT );
+
+    fclose( f );
+
+    if ( iSeqCount <= 0 || iSeqIndex <= 0 )
+    {
+        return false;
+    }
+
+    iNumSeq = iSeqCount;
+    return true;
+}
+
 // ========================================================================
 //  TRIE CACHE CLEANUP
 // ========================================================================
@@ -1869,4 +2257,188 @@ stock CreateDefaultConfigFile( const szPath[ ] )
     fprintf( f, "; admire^n^n" );
 
     fclose( f );
+}
+
+// ========================================================================
+//  MODEL RULES (INI) - weapon_inspector_models.ini
+// ========================================================================
+stock LoadModelRules( )
+{
+    new szConfigDir[ 128 ];
+    get_configsdir( szConfigDir, charsmax( szConfigDir ) );
+
+    new szPath[ 256 ];
+    formatex( szPath, charsmax( szPath ), "%s/weapon_inspector_models.ini", szConfigDir );
+
+    if ( !file_exists( szPath ) )
+    {
+        CreateDefaultModelRulesFile( szPath );
+        return;
+    }
+
+    new f = fopen( szPath, "rt" );
+
+    if ( !f )
+    {
+        return;
+    }
+
+    new szLine[ 256 ];
+    new szSection[ MODEL_PATH_LEN ];
+    szSection[ 0 ] = EOS;
+
+    while ( !feof( f ) )
+    {
+        fgets( f, szLine, charsmax( szLine ) );
+        trim( szLine );
+
+        if ( szLine[ 0 ] == EOS || szLine[ 0 ] == ';' || ( szLine[ 0 ] == '/' && szLine[ 1 ] == '/' ) )
+        {
+            continue;
+        }
+
+        // [ model/path.mdl ]
+        if ( szLine[ 0 ] == '[' )
+        {
+            ParseIniSection( szLine, szSection, charsmax( szSection ) );
+            continue;
+        }
+
+        if ( szSection[ 0 ] == EOS )
+        {
+            continue;
+        }
+
+        // KEY = VALUE
+        new szKey[ 64 ], szVal[ 64 ];
+        if ( !ParseIniKeyValue( szLine, szKey, charsmax( szKey ), szVal, charsmax( szVal ) ) )
+        {
+            continue;
+        }
+
+        if ( equali( szKey, "AUTO_INSPECT" ) )
+        {
+            TrieSetCell( g_tRuleAutoInspect, szSection, clamp( str_to_num( szVal ), 0, 1 ) );
+        }
+        else if ( equali( szKey, "MANUAL_INSPECT" ) )
+        {
+            TrieSetCell( g_tRuleManualInspect, szSection, clamp( str_to_num( szVal ), 0, 1 ) );
+        }
+        else if ( equali( szKey, "IDLE_LOOP_TIME" ) )
+        {
+            new Float:fVal = str_to_float( szVal );
+            if ( fVal < 0.0 ) fVal = 0.0;
+
+            TrieSetCell( g_tRuleIdleLoopTime, szSection, _:fVal );
+        }
+        else if ( equali( szKey, "IDLE_SEQ_FORCE" ) )
+        {
+            TrieSetCell( g_tRuleIdleSeqForce, szSection, str_to_num( szVal ) );
+        }
+    }
+
+    fclose( f );
+}
+
+stock CreateDefaultModelRulesFile( const szPath[ ] )
+{
+    new f = fopen( szPath, "wt" );
+
+    if ( !f )
+    {
+        return;
+    }
+
+    fprintf( f, "; ------------------------------------------------------------^n" );
+    fprintf( f, "; Weapon Inspector - Per-Model Rules^n" );
+    fprintf( f, "; ------------------------------------------------------------^n" );
+    fprintf( f, "; AUTO_INSPECT    = 0/1  (0 blocks baked auto-inspect via controlled idle loop)^n" );
+    fprintf( f, "; MANUAL_INSPECT  = 0/1  (0 blocks manual inspect: command/impulse)^n" );
+    fprintf( f, "; IDLE_LOOP_TIME  = float seconds (enable only if AUTO_INSPECT = 0)^n" );
+    fprintf( f, "; IDLE_SEQ_FORCE  = -1 auto / >=0 force sequence index for idle-loop^n" );
+    fprintf( f, ";^n" );
+    fprintf( f, "; NOTE: If a model has only 1 idle and it's mixed with inspect, you MUST set^n" );
+    fprintf( f, ";       IDLE_LOOP_TIME to a small value to keep idles looping before the inspect part.^n" );
+    fprintf( f, "; ------------------------------------------------------------^n^n" );
+
+    fprintf( f, ";EXAMPLE:^n" );
+    fprintf( f, ";[ models/custom/v_ak47.mdl ]^n" );
+    fprintf( f, ";AUTO_INSPECT    = 0^n" );
+    fprintf( f, ";MANUAL_INSPECT  = 1^n" );
+    fprintf( f, ";IDLE_SEQ_FORCE  = -1^n" );
+    fprintf( f, ";IDLE_LOOP_TIME  = 0.80^n^n" );
+
+    fclose( f );
+}
+
+stock ParseIniSection( const szLine[ ], szOut[ ], const iLen )
+{
+    // expects: [ something ]
+    szOut[ 0 ] = EOS;
+
+    new iStart = contain( szLine, "[" );
+    new iEnd   = contain( szLine, "]" );
+
+    if ( iStart == -1 || iEnd == -1 || iEnd <= iStart )
+    {
+        return;
+    }
+
+    new szTmp[ MODEL_PATH_LEN ];
+    copy( szTmp, charsmax( szTmp ), szLine[ iStart + 1 ] );
+    szTmp[ iEnd - ( iStart + 1 ) ] = EOS;
+
+    trim( szTmp );
+    copy( szOut, iLen, szTmp );
+}
+
+stock bool:ParseIniKeyValue( const szLine[ ], szKey[ ], const iKeyLen, szVal[ ], const iValLen )
+{
+    szKey[ 0 ] = EOS;
+    szVal[ 0 ] = EOS;
+
+    new iEq = contain( szLine, "=" );
+    if ( iEq == -1 )
+    {
+        return false;
+    }
+
+    copy( szKey, iKeyLen, szLine );
+    szKey[ iEq ] = EOS;
+    trim( szKey );
+
+    copy( szVal, iValLen, szLine[ iEq + 1 ] );
+    trim( szVal );
+
+    // strip inline comments ';' or '//' (simple)
+    new iCom = contain( szVal, ";" );
+    if ( iCom != -1 )
+    {
+        szVal[ iCom ] = EOS;
+        trim( szVal );
+    }
+
+    iCom = contain( szVal, "//" );
+    if ( iCom != -1 )
+    {
+        szVal[ iCom ] = EOS;
+        trim( szVal );
+    }
+
+    return ( szKey[ 0 ] != EOS && szVal[ 0 ] != EOS );
+}
+
+// Small utility: count keys in a Trie (for status printing)
+stock TrieCountCells( Trie:hTrie )
+{
+    if ( hTrie == Invalid_Trie )
+    {
+        return 0;
+    }
+
+    new Snapshot:hSnap = TrieSnapshotCreate( hTrie );
+    new iLen = TrieSnapshotLength( hSnap );
+    TrieSnapshotDestroy( hSnap );
+
+    return iLen;
 }
