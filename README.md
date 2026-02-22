@@ -121,7 +121,7 @@ Path:
 Rules:
 - One keyword per line
 - Case-insensitive
-- Lines starting with ; or // are comments
+- Lines starting with `;` or `//` are comments
 
 Default:
 
@@ -129,6 +129,50 @@ Default:
     lookat
     examine
     check
+
+---
+
+## NEW: Per-Model Rules (`weapon_inspector_models.ini`) 🧩
+
+This new INI lets you override behavior **per viewmodel path**, without touching code.
+
+Path:
+
+    addons/amxmodx/configs/weapon_inspector_models.ini
+
+### What It Controls
+
+Each model section is the full viewmodel path:
+
+    [ models/custom/v_ak47.mdl ]
+
+Supported keys:
+
+- `AUTO_INSPECT = 0/1`  
+  - `1` (default): do nothing special — allow the model’s normal idle behavior  
+  - `0`: blocks “baked auto-inspect” idles by forcing a controlled idle loop (requires `IDLE_LOOP_TIME`)
+
+- `MANUAL_INSPECT = 0/1`  
+  - `1` (default): allow manual inspect (command/impulse)  
+  - `0`: disable manual inspect for this model
+
+- `IDLE_LOOP_TIME = float`  
+  Enables the controlled idle loop when `AUTO_INSPECT = 0`.  
+  Use small values like `0.60`–`1.00` to prevent idles from reaching an inspect segment baked into the same sequence.
+
+- `IDLE_SEQ_FORCE = -1 / >=0`  
+  - `-1` (default): auto-pick idle from idle pool  
+  - `>= 0`: force a specific sequence index for the idle loop (only if valid for the model)
+
+### Example
+
+    [ models/custom/v_ak47.mdl ]
+    AUTO_INSPECT    = 0
+    MANUAL_INSPECT  = 1
+    IDLE_SEQ_FORCE  = -1
+    IDLE_LOOP_TIME  = 0.80
+
+> Tip: If a model has only one long `idle` animation that contains an inspect moment near the end, set `AUTO_INSPECT = 0` and tune `IDLE_LOOP_TIME` so the idle keeps restarting before reaching that inspect part.
 
 ---
 
