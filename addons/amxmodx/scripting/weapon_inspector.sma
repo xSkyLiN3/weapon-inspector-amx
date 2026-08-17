@@ -1,7 +1,7 @@
 /**
  * Weapon Inspector
  *
- * Simple tut ( install / use )
+ * Installation and usage
  * ----------------------------------------------------------------------------
  * 1) Compile and add to plugins.ini:
  *      weapon_inspector.amxx
@@ -55,6 +55,14 @@
  * - Improved idle-loop safety and engine compatibility
  * - Fixed shotgun reload compatibility (M3 / XM1014)
  *
+ * v1.1.1 — Reliability and Release Update
+ * ----------------------------------------------------------------------------
+ *
+ * - Fixed native registration style for the public API
+ * - Enforced ADMIN_RCON checks on every administrative command
+ * - Fixed cached Array handle leaks during configuration reloads
+ * - Declared the Engine module required by client_impulse
+ * - Standardized source and compiled plugin names
  *
  * ========================================================================
  */
@@ -64,6 +72,7 @@
 #include <amxmodx>
 #include <amxmisc>
 #include <cstrike>
+#include <engine>
 #include <fakemeta>
 #include <hamsandwich>
 
@@ -71,7 +80,7 @@
 //  PLUGIN INFO
 // ========================================================================
 new const PLUGIN_NAME[ ]    = "Weapon Inspector";
-new const PLUGIN_VERSION[ ] = "1.1.0";
+new const PLUGIN_VERSION[ ] = "1.1.1";
 new const PLUGIN_AUTHOR[ ]  = "SkyLiN3";
 
 // ========================================================================
@@ -275,10 +284,10 @@ public plugin_natives( )
 {
     register_library( "weapon_inspector" );
 
-    register_native( "wi_is_inspecting",         "Native_IsInspecting",        1 );
-    register_native( "wi_force_inspect",         "Native_ForceInspect",        1 );
-    register_native( "wi_block_inspect",         "Native_BlockInspect",        1 );
-    register_native( "wi_get_inspect_timeleft",  "Native_GetInspectTimeLeft",  1 );
+    register_native( "wi_is_inspecting",         "Native_IsInspecting" );
+    register_native( "wi_force_inspect",         "Native_ForceInspect" );
+    register_native( "wi_block_inspect",         "Native_BlockInspect" );
+    register_native( "wi_get_inspect_timeleft",  "Native_GetInspectTimeLeft" );
 }
 
 // ========================================================================
@@ -523,8 +532,13 @@ public Float:Native_GetInspectTimeLeft( iPlugin, iParams )
 // ========================================================================
 //  ADMIN COMMANDS
 // ========================================================================
-public Cmd_Status( id )
+public Cmd_Status( id, level, cid )
 {
+    if ( !cmd_access( id, level, cid, 1 ) )
+    {
+        return PLUGIN_HANDLED;
+    }
+
     console_print( id, "========== Weapon Inspector Status ==========" );
     console_print( id, "Version: %s", PLUGIN_VERSION );
     console_print( id, "Enabled: %d", get_pcvar_num( g_pCvarEnabled ) );
@@ -537,8 +551,13 @@ public Cmd_Status( id )
     return PLUGIN_HANDLED;
 }
 
-public Cmd_ReloadConfig( id )
+public Cmd_ReloadConfig( id, level, cid )
 {
+    if ( !cmd_access( id, level, cid, 1 ) )
+    {
+        return PLUGIN_HANDLED;
+    }
+
     ArrayClear( g_aInspectKeywords );
     g_iInspectKeywordCount = 0;
 
@@ -546,6 +565,13 @@ public Cmd_ReloadConfig( id )
     TrieClear( g_tModelAnalyzed );
     TrieClear( g_tModelSupportsInspect );
     TrieClear( g_tModelNumSeq );
+
+    CleanupTrieCache( g_tInspectSilenced );
+    CleanupTrieCache( g_tInspectUnsilenced );
+    CleanupTrieCache( g_tInspectGeneric );
+    CleanupTrieCache( g_tIdleSilenced );
+    CleanupTrieCache( g_tIdleUnsilenced );
+    CleanupTrieCache( g_tIdleGeneric );
 
     TrieClear( g_tInspectSilenced );
     TrieClear( g_tInspectUnsilenced );
@@ -2442,4 +2468,3 @@ stock TrieCountCells( Trie:hTrie )
 
     return iLen;
 }
-

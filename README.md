@@ -1,6 +1,9 @@
 # Weapon Inspector (AMX Mod X) 🔍
 
-**Weapon Inspector** adds a clean, modern “inspect weapon” feature to **Counter-Strike 1.6** — entirely **server-side**, using **AMX Mod X** with **Ham Sandwich + Fakemeta (+ CStrike)**.
+[![Build](https://github.com/xSkyLiN3/weapon-inspector-amx/actions/workflows/build.yml/badge.svg)](https://github.com/xSkyLiN3/weapon-inspector-amx/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+**Weapon Inspector** adds a clean, modern “inspect weapon” feature to **Counter-Strike 1.6** — entirely **server-side**, using **AMX Mod X** with Engine, Ham Sandwich, Fakemeta and CStrike.
 
 Players can inspect the weapon they’re holding and see the model’s **real inspect animation** (if the model has one). No client-side modifications are required.
 
@@ -57,6 +60,17 @@ Inspect is blocked in situations where it would break timing (zoomed, reloading,
 - 🧯 Safe cancellation system
 - 🧩 Developer API (natives + multi-forwards)
 - 🧰 Admin debug tools
+
+---
+
+## Requirements
+
+- Counter-Strike 1.6 dedicated server
+- AMX Mod X 1.10
+- Engine, Ham Sandwich, Fakemeta and CStrike modules enabled
+- A viewmodel containing an inspect-like sequence (`inspect`, `lookat`, `examine` or `check` by default)
+
+The default Counter-Strike models do not contain inspect animations. Unsupported models are detected and skipped without changing normal weapon behavior.
 
 ---
 
@@ -132,7 +146,7 @@ Default:
 
 ---
 
-## NEW: Per-Model Rules (`weapon_inspector_models.ini`) 🧩
+## Per-Model Rules (`weapon_inspector_models.ini`) 🧩
 
 This new INI lets you override behavior **per viewmodel path**, without touching code.
 
@@ -178,18 +192,47 @@ Supported keys:
 
 ## Installation 📦
 
-1. Compile `weapon_inspector.sma`
-2. Move `.amxx` to:
+### Release package
 
-       addons/amxmodx/plugins/
-
-3. Add to:
+1. Download `weapon-inspector-vX.Y.Z.zip` from the Releases page.
+2. Extract its `addons` directory into the server's Counter-Strike directory.
+3. Add the plugin to:
 
        addons/amxmodx/configs/plugins.ini
 
        weapon_inspector.amxx
 
-4. Restart server or change map
+4. Review `weapon_inspector.cfg`, then restart the server or change the map.
+
+### Build from source
+
+Download the AMX Mod X 1.10 base package and Counter-Strike addon, then run:
+
+    .\scripts\build.ps1 -AmxxRoot C:\path\to\amxmodx
+
+The script compiles `addons/amxmodx/scripting/weapon_inspector.sma` and writes `weapon_inspector.amxx` to `dist/` by default. The same compilation is executed by GitHub Actions on every pull request and push to `main`.
+
+---
+
+## Administrative Commands
+
+| Command | Access | Description |
+|---------|--------|-------------|
+| `wi_status` | `ADMIN_RCON` | Shows plugin version and cache/configuration status |
+| `wi_reload_config` | `ADMIN_RCON` | Reloads keyword/model rules and safely rebuilds the model cache |
+| `wi_debug <player>` | `ADMIN_RCON` | Shows state, timing, model and sequence information for a player |
+
+Console access and the AMX Mod X `ADMIN_RCON` flag are accepted. Other clients are rejected by `cmd_access`.
+
+---
+
+## Versioning and Releases
+
+This project follows [Semantic Versioning](https://semver.org/). Patch releases contain compatible fixes, minor releases add backward-compatible functionality and major releases may change configuration or API contracts.
+
+Release tags must match the value in `VERSION` (for example, `v1.1.1`). A matching tag compiles the plugin, creates the consistently named `weapon-inspector-v1.1.1.zip` package and publishes it as a GitHub Release asset.
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ---
 

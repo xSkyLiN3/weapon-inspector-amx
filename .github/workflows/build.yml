@@ -1,0 +1,123 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AMXX_VERSION: 1.10.0-git5478
+  AMXX_BASE_SHA256: da84a2153e75b058ceaef88e522bc13d311e719acb8680169e1ddf17c0ed7537
+  AMXX_CSTRIKE_SHA256: a3f6c6df28e064840c6d8f05449b3bd7c857c407551fb6d6bd7df57bce488a62
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Read and validate version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          grep -Fq "new const PLUGIN_VERSION[ ] = \"${version}\";" addons/amxmodx/scripting/weapon_inspector.sma
+          echo "value=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Install 32-bit runtime and packaging tools
+        run: sudo apt-get update && sudo apt-get install --yes libc6-i386 zip
+
+      - name: Download verified AMX Mod X toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="amxmodx-${AMXX_VERSION}-base-linux.tar.gz"
+          cstrike="amxmodx-${AMXX_VERSION}-cstrike-linux.tar.gz"
+          curl --fail --location --silent --show-error "https://www.amxmodx.org/amxxdrop/1.10/${base}" --output "${base}"
+          curl --fail --location --silent --show-error "https://www.amxmodx.org/amxxdrop/1.10/${cstrike}" --output "${cstrike}"
+          echo "${AMXX_BASE_SHA256}  ${base}" | sha256sum --check --strict
+          echo "${AMXX_CSTRIKE_SHA256}  ${cstrike}" | sha256sum --check --strict
+          mkdir -p .toolchain
+          tar -xzf "${base}" -C .toolchain
+          tar -xzf "${cstrike}" -C .toolchain
+
+      - name: Compile plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          compiler=".toolchain/addons/amxmodx/scripting/amxxpc"
+          includes=".toolchain/addons/amxmodx/scripting/include"
+          output="dist/addons/amxmodx/plugins/weapon_inspector.amxx"
+          chmod +x "$compiler"
+          mkdir -p "$(dirname "$output")"
+          LD_LIBRARY_PATH="$(dirname "$compiler")${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+            "$compiler" addons/amxmodx/scripting/weapon_inspector.sma "-i${includes}" "-o${output}"
+          test -s "$output"
+
+      - name: Assemble release package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="dist/package"
+          mkdir -p "$package/addons/amxmodx/plugins" "$package/addons/amxmodx/configs" "$package/addons/amxmodx/scripting/include"
+          cp dist/addons/amxmodx/plugins/weapon_inspector.amxx "$package/addons/amxmodx/plugins/"
+          cp addons/amxmodx/configs/inspect_list.ini addons/amxmodx/configs/weapon_inspector.cfg addons/amxmodx/configs/weapon_inspector_models.ini "$package/addons/amxmodx/configs/"
+          cp addons/amxmodx/scripting/weapon_inspector.sma "$package/addons/amxmodx/scripting/"
+          cp addons/amxmodx/scripting/include/weapon_inspector.inc "$package/addons/amxmodx/scripting/include/"
+          cp README.md CHANGELOG.md LICENSE VERSION "$package/"
+          (cd "$package" && zip -9 -r "../weapon-inspector-v${{ steps.version.outputs.value }}.zip" .)
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weapon-inspector-${{ steps.version.outputs.value }}
+          path: dist/weapon-inspector-v${{ steps.version.outputs.value }}.zip
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Validate tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF_NAME}" = "v${{ needs.build.outputs.version }}"
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: weapon-inspector-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          asset="dist/weapon-inspector-${GITHUB_REF_NAME}.zip"
+          if [[ -f "$notes" ]]; then
+            gh release create "$GITHUB_REF_NAME" "$asset" --verify-tag --title "Weapon Inspector ${GITHUB_REF_NAME}" --notes-file "$notes"
+          else
+            gh release create "$GITHUB_REF_NAME" "$asset" --verify-tag --title "Weapon Inspector ${GITHUB_REF_NAME}" --generate-notes
+          fi
