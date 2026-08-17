@@ -61,7 +61,8 @@ jobs:
           output="dist/addons/amxmodx/plugins/weapon_inspector.amxx"
           chmod +x "$compiler"
           mkdir -p "$(dirname "$output")"
-          "$compiler" addons/amxmodx/scripting/weapon_inspector.sma "-i${includes}" "-o${output}"
+          LD_LIBRARY_PATH="$(dirname "$compiler")${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+            "$compiler" addons/amxmodx/scripting/weapon_inspector.sma "-i${includes}" "-o${output}"
           test -s "$output"
 
       - name: Assemble release package
