@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Cristobal Vergara
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
