@@ -1,3 +1,8 @@
+/*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 Cristobal Vergara
+ */
+
 #if defined _weapon_inspector_included
     #endinput
 #endif
@@ -51,8 +56,9 @@ native bool:wi_force_inspect( const id );
 /**
  * Blocks inspecting for a period of time (seconds).
  *
- * If the player is currently inspecting, the plugin will cancel inspect softly
- * and restore an idle animation to return to a natural state.
+ * If the player is currently inspecting, the plugin cancels it and restores a
+ * detected idle animation when one is available. Otherwise, it releases the
+ * idle timer so the GameDLL can choose the next animation.
  *
  * Typical usage:
  * - Minigames / special events
