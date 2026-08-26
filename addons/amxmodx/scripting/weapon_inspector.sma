@@ -1,3 +1,8 @@
+/*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 Cristobal Vergara
+ */
+
 /**
  * Weapon Inspector
  *
@@ -64,6 +69,15 @@
  * - Declared the Engine module required by client_impulse
  * - Standardized source and compiled plugin names
  *
+ * v1.1.2 — Runtime and Parser Correctness Update
+ * ----------------------------------------------------------------------------
+ *
+ * - Corrected predicted weapon timer semantics
+ * - Made the master enable switch stop all runtime hooks
+ * - Hardened GoldSrc Studio model parsing and INI bounds checks
+ * - Preserved normal weapon behavior for unsupported viewmodels
+ * - Corrected bodygroup selection and forced-inspect busy-window handling
+ *
  * ========================================================================
  */
 
@@ -80,8 +94,8 @@
 //  PLUGIN INFO
 // ========================================================================
 new const PLUGIN_NAME[ ]    = "Weapon Inspector";
-new const PLUGIN_VERSION[ ] = "1.1.1";
-new const PLUGIN_AUTHOR[ ]  = "SkyLiN3";
+new const PLUGIN_VERSION[ ] = "1.1.2";
+new const PLUGIN_AUTHOR[ ]  = "Cristobal Vergara";
 
 // ========================================================================
 //  OFFSETS
@@ -103,11 +117,23 @@ const m_pActiveItem           = 373;
 // ========================================================================
 #define MAX_PLAYERS           32
 
-#define SEQ_NAME_LEN          32
+#define SEQ_LABEL_BYTES       32
+#define SEQ_NAME_LEN          33
 #define MODEL_PATH_LEN        128
 #define KEYWORD_MAX_LEN       16
 
 #define MAX_INSPECT_KEYWORDS  32
+#define MAX_STUDIO_SEQUENCES  2048
+#define MAX_WEAPON_ANIM_SEQ   255
+
+#define STUDIO_MAGIC          0x54534449
+#define STUDIO_VERSION        10
+#define STUDIO_HEADER_SIZE    244
+#define STUDIO_LENGTH_OFFSET  72
+#define STUDIO_NUMSEQ_OFFSET  164
+#define STUDIO_SEQDESC_SIZE   176
+#define STUDIO_SEQDESC_FPS    32
+#define STUDIO_SEQDESC_FRAMES 56
 
 #define MIN_MODEL_SIZE        1024
 #define MAX_MODEL_SIZE        5242880
@@ -124,14 +150,6 @@ const WPNS_NO_INSPECT = ( 1 << CSW_C4 )
                       | ( 1 << CSW_HEGRENADE )
                       | ( 1 << CSW_FLASHBANG )
                       | ( 1 << CSW_SMOKEGRENADE );
-
-// Weapons with scope capability
-const WPNS_SCOPED = ( 1 << CSW_AUG )
-                  | ( 1 << CSW_AWP )
-                  | ( 1 << CSW_G3SG1 )
-                  | ( 1 << CSW_SCOUT )
-                  | ( 1 << CSW_SG550 )
-                  | ( 1 << CSW_SG552 );
 
 // ========================================================================
 //  SILENCER ACTION KEYWORDS (Blacklist)
@@ -231,8 +249,9 @@ new Float:g_fCooldownUntil[ MAX_PLAYERS + 1 ];
 new Float:g_fBusyUntil[ MAX_PLAYERS + 1 ];
 new Float:g_fBlockedUntil[ MAX_PLAYERS + 1 ];
 
-// Idle-loop throttle
+// Idle-loop throttle and explicit ownership of the weapon timer it changed.
 new Float:g_fNextIdleLoop[ MAX_PLAYERS + 1 ];
+new g_iIdleLoopWeapon[ MAX_PLAYERS + 1 ];
 
 // Track last viewmodel per player to detect weapon switches
 new g_szLastViewModel[ MAX_PLAYERS + 1 ][ MODEL_PATH_LEN ];
@@ -373,6 +392,7 @@ public plugin_init( )
 
     // Events
     register_event( "HLTV", "Event_RoundStart", "a", "1=0", "2=0" );
+    register_event( "DeathMsg", "Event_DeathMsg", "a" );
 }
 
 public plugin_cfg( )
@@ -444,6 +464,16 @@ public Event_RoundStart( )
         {
             ResetPlayerState( i );
         }
+    }
+}
+
+public Event_DeathMsg( )
+{
+    new id = read_data( 2 );
+
+    if ( 1 <= id <= MAX_PLAYERS )
+    {
+        ResetPlayerState( id );
     }
 }
 
@@ -712,7 +742,7 @@ public client_impulse( id, impulse )
 
     new iMode = get_pcvar_num( g_pCvarImpulseMode );
 
-    if ( iMode == 0 )
+    if ( iMode != 1 && iMode != 2 )
     {
         return PLUGIN_CONTINUE;
     }
@@ -800,10 +830,11 @@ stock bool:WI_TryInspect( const id, const bool:bForced )
     }
 
     // Safe timing checks (do not break weapon logic)
-    new Float:flNextAttack  = get_pdata_float( id,     m_flNextAttack,         XO_PLAYER );
-    new Float:flNextPrimary = get_pdata_float( weapon, m_flNextPrimaryAttack,  XO_WEAPON );
+    new Float:flNextAttack    = get_pdata_float( id,     m_flNextAttack,           XO_PLAYER );
+    new Float:flNextPrimary   = get_pdata_float( weapon, m_flNextPrimaryAttack,    XO_WEAPON );
+    new Float:flNextSecondary = get_pdata_float( weapon, m_flNextSecondaryAttack,  XO_WEAPON );
 
-    if ( flNextAttack > 0.0 || flNextPrimary > 0.0 )
+    if ( flNextAttack > 0.0 || flNextPrimary > 0.0 || flNextSecondary > 0.0 )
     {
         return false;
     }
@@ -822,15 +853,17 @@ stock bool:WI_TryInspect( const id, const bool:bForced )
         return false;
     }
 
+    // Forced calls may bypass cooldown/rate limiting, but not an active
+    // gameplay safety window created by firing, deploying or reloading.
+    if ( get_gametime( ) < g_fBusyUntil[ id ] )
+    {
+        return false;
+    }
+
     // Non-forced restrictions
     if ( !bForced )
     {
         if ( get_gametime( ) < g_fCooldownUntil[ id ] )
-        {
-            return false;
-        }
-
-        if ( get_gametime( ) < g_fBusyUntil[ id ] )
         {
             return false;
         }
@@ -878,12 +911,12 @@ stock bool:WI_TryInspect( const id, const bool:bForced )
     g_fInspectEnd[ id ] = get_gametime( ) + fDuration;
 
     // IMPORTANT: ensure idle-loop never runs during inspect
-    g_fNextIdleLoop[ id ] = 0.0;
+    ClearIdleLoopState( id );
 
     // Play inspect
-    PlayWeaponAnim( id, iSeq );
+    PlayWeaponAnim( id, weapon, iSeq );
 
-    // Natural idle: push weapon idle into the future
+    // Natural idle: push weapon idle into the future.
     BlockWeaponIdle( id, weapon, g_fInspectEnd[ id ] + IDLE_BLOCK_PAD );
 
     ExecuteForward( g_fwdInspectStart, _, id, weapon, iSeq );
@@ -898,7 +931,15 @@ public HamHook_PrimaryAttack_Post( weapon )
 {
     new id = get_pdata_cbase( weapon, m_pPlayer, XO_WEAPON );
 
-    if ( !is_user_alive( id ) )
+    if ( id < 1 || id > MAX_PLAYERS )
+    {
+        return;
+    }
+
+    // GameDLL may have replaced the timer written by the automatic idle loop.
+    ClearIdleLoopState( id );
+
+    if ( !get_pcvar_num( g_pCvarEnabled ) || !is_user_alive( id ) )
     {
         return;
     }
@@ -955,7 +996,14 @@ public HamHook_SecondaryAttack_Post( weapon )
 {
     new id = get_pdata_cbase( weapon, m_pPlayer, XO_WEAPON );
 
-    if ( !is_user_alive( id ) )
+    if ( id < 1 || id > MAX_PLAYERS )
+    {
+        return;
+    }
+
+    ClearIdleLoopState( id );
+
+    if ( !get_pcvar_num( g_pCvarEnabled ) || !is_user_alive( id ) )
     {
         return;
     }
@@ -963,39 +1011,37 @@ public HamHook_SecondaryAttack_Post( weapon )
     new szModel[ MODEL_PATH_LEN ];
     if ( !GetPlayerViewModel( id, szModel, charsmax( szModel ) ) || !ModelSupportsInspect( szModel ) )
     {
-        new wpn_id = get_user_weapon( id );
-        if ( WPNS_SCOPED & ( 1 << wpn_id ) )
-        {
-            if ( cs_get_user_zoom( id ) <= CS_SET_NO_ZOOM )
-            {
-                PlayWeaponAnim( id, 0 );
-            }
-        }
         return;
-    }
-
-    new wpn_id = get_user_weapon( id );
-
-    if ( WPNS_SCOPED & ( 1 << wpn_id ) )
-    {
-        if ( cs_get_user_zoom( id ) <= CS_SET_NO_ZOOM )
-        {
-            PlayWeaponAnim( id, 0 );
-        }
     }
 
     if ( g_bInspecting[ id ] )
     {
-        CancelInspect( id, false );
-        SetCooldown( id, get_gametime( ) + 0.50 );
+        CancelInspect( id, true );
     }
+
+    new Float:fSecondaryDelay = get_pdata_float( weapon, m_flNextSecondaryAttack, XO_WEAPON );
+    if ( fSecondaryDelay < 0.0 )
+    {
+        fSecondaryDelay = 0.0;
+    }
+
+    new Float:fUntil = get_gametime( ) + floatmax( fSecondaryDelay, 0.50 );
+    g_fBusyUntil[ id ] = floatmax( g_fBusyUntil[ id ], fUntil );
+    SetCooldown( id, fUntil );
 }
 
 public HamHook_Deploy_Post( weapon )
 {
     new id = get_pdata_cbase( weapon, m_pPlayer, XO_WEAPON );
 
-    if ( !is_user_alive( id ) )
+    if ( id < 1 || id > MAX_PLAYERS )
+    {
+        return;
+    }
+
+    ClearIdleLoopState( id );
+
+    if ( !get_pcvar_num( g_pCvarEnabled ) || !is_user_alive( id ) )
     {
         return;
     }
@@ -1021,7 +1067,14 @@ public HamHook_Reload_Post( weapon )
 {
     new id = get_pdata_cbase( weapon, m_pPlayer, XO_WEAPON );
 
-    if ( !is_user_alive( id ) )
+    if ( id < 1 || id > MAX_PLAYERS )
+    {
+        return;
+    }
+
+    ClearIdleLoopState( id );
+
+    if ( !get_pcvar_num( g_pCvarEnabled ) || !is_user_alive( id ) )
     {
         return;
     }
@@ -1066,6 +1119,31 @@ public FMHook_PreThink( id )
         return FMRES_IGNORED;
     }
 
+    if ( !get_pcvar_num( g_pCvarEnabled ) )
+    {
+        new Float:fNow = get_gametime( );
+        new weapon = get_pdata_cbase( id, m_pActiveItem, XO_PLAYER );
+        new bool:bWasInspecting = g_bInspecting[ id ];
+        new bool:bOwnsIdleLoop = pev_valid( weapon )
+            && g_iIdleLoopWeapon[ id ] == weapon
+            && g_fNextIdleLoop[ id ] > fNow;
+
+        if ( bWasInspecting )
+        {
+            // Restore a known idle when possible, then immediately release
+            // the predicted weapon timer so disabled hooks leave no lock.
+            CancelInspect( id, true );
+        }
+
+        if ( pev_valid( weapon ) && ( bWasInspecting || bOwnsIdleLoop ) )
+        {
+            BlockWeaponIdle( id, weapon, fNow );
+        }
+
+        ClearIdleLoopState( id );
+        return FMRES_IGNORED;
+    }
+
     // ------------------------------------------------------------
     // While inspecting: NEVER run idle-loop.
     // ------------------------------------------------------------
@@ -1076,7 +1154,7 @@ public FMHook_PreThink( id )
 
         if ( buttons & ( IN_ATTACK | IN_ATTACK2 ) )
         {
-            CancelInspect( id, false );
+            CancelInspect( id, true );
             SetCooldown( id, get_gametime( ) + 0.30 );
             return FMRES_IGNORED;
         }
@@ -1125,11 +1203,6 @@ public FMHook_PreThink( id )
     // ------------------------------------------------------------
     // Not inspecting: apply per-model AUTO idle-loop if configured.
     // ------------------------------------------------------------
-    if ( !get_pcvar_num( g_pCvarEnabled ) )
-    {
-        return FMRES_IGNORED;
-    }
-
     new szModel[ MODEL_PATH_LEN ];
     if ( !GetPlayerViewModel( id, szModel, charsmax( szModel ) ) )
     {
@@ -1175,13 +1248,22 @@ public FMHook_PreThink( id )
     new buttons = pev( id, pev_button );
     if ( buttons & ( IN_ATTACK | IN_ATTACK2 ) )
     {
+        // Secondary actions are not hooked for every weapon class. Invalidate
+        // ownership before GameDLL can replace the timer we previously wrote.
+        ClearIdleLoopState( id );
         return FMRES_IGNORED;
     }
 
     new weapon = get_pdata_cbase( id, m_pActiveItem, XO_PLAYER );
     if ( !pev_valid( weapon ) )
     {
+        ClearIdleLoopState( id );
         return FMRES_IGNORED;
+    }
+
+    if ( g_iIdleLoopWeapon[ id ] != 0 && g_iIdleLoopWeapon[ id ] != weapon )
+    {
+        ClearIdleLoopState( id );
     }
 
     // Shotgun special reload: NEVER interfere (fix)
@@ -1213,7 +1295,7 @@ public FMHook_PreThink( id )
         // Validate against model seq count (cached)
         new iNumSeq = GetModelNumSeqCached( szModel );
 
-        if ( iNumSeq > 0 && iForced < iNumSeq )
+        if ( iNumSeq > 0 && iForced < iNumSeq && iForced <= MAX_WEAPON_ANIM_SEQ )
         {
             iIdleSeq = iForced;
         }
@@ -1241,21 +1323,13 @@ public FMHook_PreThink( id )
         fLoopTime = 0.05;
     }
 
-    // Force a controlled idle loop to prevent reaching baked "inspect" section.
-    // IMPORTANT: To actually "restart" visually, reset the viewmodel entity cycle.
-    new iVm = pev( id, pev_viewmodel );
+    // Restart through the weapon animation message. pev_viewmodel is a string
+    // handle in GoldSrc, not an entity that can safely receive set_pev calls.
+    PlayWeaponAnim( id, weapon, iIdleSeq );
 
-    if ( pev_valid( iVm ) )
-    {
-        set_pev( iVm, pev_frame, 0.0 );
-        set_pev( iVm, pev_animtime, gt );
-        set_pev( iVm, pev_framerate, 1.0 );
-    }
-
-    PlayWeaponAnim( id, iIdleSeq );
-
-    set_pdata_float( weapon, m_flTimeWeaponIdle, gt + fLoopTime, XO_WEAPON );
+    BlockWeaponIdle( id, weapon, gt + fLoopTime );
     g_fNextIdleLoop[ id ] = gt + fLoopTime;
+    g_iIdleLoopWeapon[ id ] = weapon;
 
     return FMRES_IGNORED;
 }
@@ -1263,6 +1337,12 @@ public FMHook_PreThink( id )
 // ========================================================================
 //  HELPERS - State Management
 // ========================================================================
+stock ClearIdleLoopState( const id )
+{
+    g_fNextIdleLoop[ id ] = 0.0;
+    g_iIdleLoopWeapon[ id ] = 0;
+}
+
 stock ResetPlayerState( const id )
 {
     if ( g_bInspecting[ id ] )
@@ -1277,7 +1357,7 @@ stock ResetPlayerState( const id )
     g_iInspectCount[ id ]      = 0;
     g_fLastInspectReset[ id ]  = 0.0;
 
-    g_fNextIdleLoop[ id ]      = 0.0;
+    ClearIdleLoopState( id );
 
     g_szLastViewModel[ id ][ 0 ] = EOS;
     g_iInspectSeq[ id ]          = -1;
@@ -1293,7 +1373,7 @@ stock CancelInspect( const id, bool:bPlayIdle = true )
     g_fInspectEnd[ id ] = 0.0;
 
     // ensure idle-loop won't collide right after inspect ends
-    g_fNextIdleLoop[ id ] = 0.0;
+    ClearIdleLoopState( id );
 
     if ( bPlayIdle && bWasInspecting && is_user_alive( id ) )
     {
@@ -1314,7 +1394,7 @@ stock CancelInspect( const id, bool:bPlayIdle = true )
                 {
                     new iNumSeq = GetModelNumSeqCached( szModel );
 
-                    if ( iNumSeq > 0 && iForced < iNumSeq )
+                    if ( iNumSeq > 0 && iForced < iNumSeq && iForced <= MAX_WEAPON_ANIM_SEQ )
                     {
                         iIdleSeq = iForced;
                         fIdleDur = 3.0;
@@ -1326,19 +1406,24 @@ stock CancelInspect( const id, bool:bPlayIdle = true )
             {
                 if ( !GetIdleSequenceAndDuration( id, weapon, iIdleSeq, fIdleDur ) )
                 {
-                    iIdleSeq = 0;
-                    fIdleDur = 3.0;
+                    // No known idle sequence: let the GameDLL choose its
+                    // normal idle instead of assuming sequence 0 is safe.
+                    BlockWeaponIdle( id, weapon, get_gametime( ) );
+                    iIdleSeq = -1;
                 }
             }
 
-            PlayWeaponAnim( id, iIdleSeq );
-
-            if ( fIdleDur < 0.10 )
+            if ( iIdleSeq >= 0 )
             {
-                fIdleDur = 3.0;
-            }
+                PlayWeaponAnim( id, weapon, iIdleSeq );
 
-            set_pdata_float( weapon, m_flTimeWeaponIdle, get_gametime( ) + fIdleDur, XO_WEAPON );
+                if ( fIdleDur < 0.10 )
+                {
+                    fIdleDur = 3.0;
+                }
+
+                BlockWeaponIdle( id, weapon, get_gametime( ) + fIdleDur );
+            }
         }
     }
 
@@ -1383,24 +1468,42 @@ stock bool:CheckRateLimit( const id )
 // ========================================================================
 //  HELPERS - Animation & Idle
 // ========================================================================
-stock PlayWeaponAnim( const id, const iAnim )
+stock PlayWeaponAnim( const id, const weapon, const iAnim )
 {
-    set_pev( id, pev_weaponanim, iAnim );
-
-    message_begin( MSG_ONE_UNRELIABLE, SVC_WEAPONANIM, { 0, 0, 0 }, id );
-    write_byte( iAnim );
-    write_byte( pev( id, pev_body ) );
-    message_end( );
-}
-
-stock BlockWeaponIdle( const id, const weapon, const Float:fUntil )
-{
-    if ( !is_user_alive( id ) )
+    if ( !is_user_alive( id )
+        || !pev_valid( weapon )
+        || iAnim < 0
+        || iAnim > MAX_WEAPON_ANIM_SEQ )
     {
         return;
     }
 
-    set_pdata_float( weapon, m_flTimeWeaponIdle, fUntil, XO_WEAPON );
+    new iBody = clamp( pev( weapon, pev_body ), 0, 255 );
+
+    set_pev( id, pev_weaponanim, iAnim );
+
+    message_begin( MSG_ONE_UNRELIABLE, SVC_WEAPONANIM, { 0, 0, 0 }, id );
+    write_byte( iAnim );
+    write_byte( iBody );
+    message_end( );
+}
+
+stock BlockWeaponIdle( const id, const weapon, const Float:fAbsoluteUntil )
+{
+    if ( !is_user_alive( id ) || !pev_valid( weapon ) )
+    {
+        return;
+    }
+
+    new Float:fDelay = fAbsoluteUntil - get_gametime( );
+
+    if ( fDelay < 0.0 )
+    {
+        fDelay = 0.0;
+    }
+
+    // CS 1.6 predicted weapon timers are stored as relative durations.
+    set_pdata_float( weapon, m_flTimeWeaponIdle, fDelay, XO_WEAPON );
 }
 
 stock bool:GetPlayerViewModel( const id, szModel[ ], const iLen )
@@ -1490,6 +1593,76 @@ stock bool:ModelSupportsInspect( const szModel[ ] )
 // ========================================================================
 //  MODEL VALIDATION
 // ========================================================================
+stock bool:ReadStudioSequenceTable( const szModel[ ], &iSeqCount, &iSeqIndex )
+{
+    iSeqCount = 0;
+    iSeqIndex = 0;
+
+    new iFileSize = file_size( szModel, 0 );
+
+    if ( iFileSize < MIN_MODEL_SIZE || iFileSize > MAX_MODEL_SIZE )
+    {
+        return false;
+    }
+
+    new f = fopen( szModel, "rb" );
+
+    if ( !f )
+    {
+        return false;
+    }
+
+    new iMagic;
+    new iVersion;
+    new iDeclaredLength;
+    new bool:bReadOk = true;
+
+    if ( fseek( f, 0, SEEK_SET ) != 0
+        || fread( f, iMagic, BLOCK_INT ) != 1
+        || fread( f, iVersion, BLOCK_INT ) != 1 )
+    {
+        bReadOk = false;
+    }
+
+    if ( bReadOk
+        && ( fseek( f, STUDIO_LENGTH_OFFSET, SEEK_SET ) != 0
+            || fread( f, iDeclaredLength, BLOCK_INT ) != 1 ) )
+    {
+        bReadOk = false;
+    }
+
+    if ( bReadOk
+        && ( fseek( f, STUDIO_NUMSEQ_OFFSET, SEEK_SET ) != 0
+            || fread( f, iSeqCount, BLOCK_INT ) != 1
+            || fread( f, iSeqIndex, BLOCK_INT ) != 1 ) )
+    {
+        bReadOk = false;
+    }
+
+    fclose( f );
+
+    if ( !bReadOk
+        || iMagic != STUDIO_MAGIC
+        || iVersion != STUDIO_VERSION
+        || iDeclaredLength < STUDIO_HEADER_SIZE
+        || iDeclaredLength > iFileSize
+        || iSeqCount < 1
+        || iSeqCount > MAX_STUDIO_SEQUENCES
+        || iSeqIndex < STUDIO_HEADER_SIZE
+        || iSeqIndex > iDeclaredLength )
+    {
+        return false;
+    }
+
+    // Division avoids overflow in iSeqCount * STUDIO_SEQDESC_SIZE.
+    if ( iSeqCount > ( iDeclaredLength - iSeqIndex ) / STUDIO_SEQDESC_SIZE )
+    {
+        return false;
+    }
+
+    return true;
+}
+
 stock bool:ValidateModelFile( const szModel[ ] )
 {
     new iValid;
@@ -1499,41 +1672,12 @@ stock bool:ValidateModelFile( const szModel[ ] )
         return ( iValid != 0 );
     }
 
-    if ( !file_exists( szModel ) )
-    {
-        TrieSetCell( g_tModelValidated, szModel, 0 );
-        return false;
-    }
+    new iSeqCount;
+    new iSeqIndex;
+    new bool:bValid = ReadStudioSequenceTable( szModel, iSeqCount, iSeqIndex );
 
-    new iSize = file_size( szModel, 0 );
-
-    if ( iSize < MIN_MODEL_SIZE || iSize > MAX_MODEL_SIZE )
-    {
-        TrieSetCell( g_tModelValidated, szModel, 0 );
-        return false;
-    }
-
-    // Studio header magic "IDST" = 0x54534449
-    new f = fopen( szModel, "rb" );
-
-    if ( !f )
-    {
-        TrieSetCell( g_tModelValidated, szModel, 0 );
-        return false;
-    }
-
-    new iMagic;
-    fread( f, iMagic, BLOCK_INT );
-    fclose( f );
-
-    if ( iMagic != 0x54534449 )
-    {
-        TrieSetCell( g_tModelValidated, szModel, 0 );
-        return false;
-    }
-
-    TrieSetCell( g_tModelValidated, szModel, 1 );
-    return true;
+    TrieSetCell( g_tModelValidated, szModel, bValid ? 1 : 0 );
+    return bValid;
 }
 
 // ========================================================================
@@ -1541,6 +1685,11 @@ stock bool:ValidateModelFile( const szModel[ ] )
 // ========================================================================
 stock bool:EnsureModelAnalyzed( const szModel[ ] )
 {
+    if ( !ValidateModelFile( szModel ) )
+    {
+        return false;
+    }
+
     new iAnalyzed;
 
     if ( TrieGetCell( g_tModelAnalyzed, szModel, iAnalyzed ) )
@@ -1581,6 +1730,12 @@ stock bool:AnalyzeModelSequences( const szModel[ ] )
     for ( new i = 0; i < iSeqCount; i++ )
     {
         ArrayGetString( aSeqNames, i, szSeqName, charsmax( szSeqName ) );
+
+        // SVC_WEAPONANIM carries the sequence index in one byte.
+        if ( i > MAX_WEAPON_ANIM_SEQ )
+        {
+            continue;
+        }
 
         if ( IsSilencerActionSequence( szSeqName ) )
         {
@@ -1965,39 +2120,56 @@ stock bool:GetAllSequenceNames( const szModel[ ], &Array:aSeqNames, &iCount )
     iCount = 0;
     aSeqNames = Invalid_Array;
 
-    new f = fopen( szModel, "rb" );
+    new iSeqCount;
+    new iSeqIndex;
 
-    if ( !f )
+    if ( !ReadStudioSequenceTable( szModel, iSeqCount, iSeqIndex ) )
     {
         return false;
     }
 
-    const STUDIOHEADER_NUMSEQ = 164;
-    const SEQDESC_SIZE = 176;
+    new f = fopen( szModel, "rb" );
 
-    new iSeqCount, iSeqIndex;
-
-    fseek( f, STUDIOHEADER_NUMSEQ, SEEK_SET );
-    fread( f, iSeqCount, BLOCK_INT );
-    fread( f, iSeqIndex, BLOCK_INT );
-
-    if ( iSeqCount <= 0 || iSeqIndex <= 0 )
+    if ( !f || fseek( f, iSeqIndex, SEEK_SET ) != 0 )
     {
-        fclose( f );
+        if ( f )
+        {
+            fclose( f );
+        }
+
         return false;
     }
 
     aSeqNames = ArrayCreate( SEQ_NAME_LEN, iSeqCount );
 
-    fseek( f, iSeqIndex, SEEK_SET );
+    if ( aSeqNames == Invalid_Array )
+    {
+        fclose( f );
+        return false;
+    }
 
     new szName[ SEQ_NAME_LEN ];
 
     for ( new i = 0; i < iSeqCount; i++ )
     {
-        fread_blocks( f, szName, SEQ_NAME_LEN, BLOCK_CHAR );
-        fseek( f, SEQDESC_SIZE - SEQ_NAME_LEN, SEEK_CUR );
+        if ( fread_blocks( f, szName, SEQ_LABEL_BYTES, BLOCK_CHAR ) != SEQ_LABEL_BYTES )
+        {
+            fclose( f );
+            ArrayDestroy( aSeqNames );
+            aSeqNames = Invalid_Array;
+            return false;
+        }
+
+        szName[ SEQ_LABEL_BYTES ] = EOS;
         ArrayPushString( aSeqNames, szName );
+
+        if ( fseek( f, STUDIO_SEQDESC_SIZE - SEQ_LABEL_BYTES, SEEK_CUR ) != 0 )
+        {
+            fclose( f );
+            ArrayDestroy( aSeqNames );
+            aSeqNames = Invalid_Array;
+            return false;
+        }
     }
 
     fclose( f );
@@ -2018,6 +2190,16 @@ stock bool:GetSequenceDurationByIndex( const szModel[ ], const iSeq, &Float:fDur
 {
     fDuration = 0.0;
 
+    new iSeqCount;
+    new iSeqIndex;
+
+    if ( !ReadStudioSequenceTable( szModel, iSeqCount, iSeqIndex )
+        || iSeq < 0
+        || iSeq >= iSeqCount )
+    {
+        return false;
+    }
+
     new f = fopen( szModel, "rb" );
 
     if ( !f )
@@ -2025,75 +2207,36 @@ stock bool:GetSequenceDurationByIndex( const szModel[ ], const iSeq, &Float:fDur
         return false;
     }
 
-    const STUDIOHEADER_NUMSEQ = 164;
-    const SEQDESC_SIZE = 176;
-    const SEQDESC_FPS = 32;
+    new iDescriptor = iSeqIndex + ( iSeq * STUDIO_SEQDESC_SIZE );
+    new iFpsRaw;
+    new iFrames;
 
-    new iSeqCount, iSeqIndex;
-
-    fseek( f, STUDIOHEADER_NUMSEQ, SEEK_SET );
-    fread( f, iSeqCount, BLOCK_INT );
-    fread( f, iSeqIndex, BLOCK_INT );
-
-    if ( iSeqCount <= 0 || iSeqIndex <= 0 || iSeq < 0 || iSeq >= iSeqCount )
+    if ( fseek( f, iDescriptor + STUDIO_SEQDESC_FPS, SEEK_SET ) != 0
+        || fread( f, iFpsRaw, BLOCK_INT ) != 1
+        || fseek( f, iDescriptor + STUDIO_SEQDESC_FRAMES, SEEK_SET ) != 0
+        || fread( f, iFrames, BLOCK_INT ) != 1 )
     {
         fclose( f );
         return false;
     }
 
-    new iFpsRaw;
-
-    fseek( f, iSeqIndex + ( iSeq * SEQDESC_SIZE ) + SEQDESC_FPS, SEEK_SET );
-    fread( f, iFpsRaw, BLOCK_INT );
-
-    new iFrames56, iFrames60;
-
-    fseek( f, iSeqIndex + ( iSeq * SEQDESC_SIZE ) + 56, SEEK_SET );
-    fread( f, iFrames56, BLOCK_INT );
-
-    fseek( f, iSeqIndex + ( iSeq * SEQDESC_SIZE ) + 60, SEEK_SET );
-    fread( f, iFrames60, BLOCK_INT );
-
     fclose( f );
 
-    new iFrames = PickBestFrames( iFrames56, iFrames60 );
-
-    if ( iFrames <= 0 )
+    if ( iFrames < 1 || iFrames > 10000 )
     {
         return false;
     }
 
     new Float:fFps = Float:iFpsRaw;
 
-    if ( fFps < 1.0 || fFps > 200.0 )
+    if ( !( fFps >= 1.0 && fFps <= 200.0 ) )
     {
         fFps = 30.0;
     }
 
     fDuration = float( iFrames ) / fFps;
 
-    if ( fDuration < 0.0 )
-    {
-        fDuration = 0.0;
-    }
-
     return true;
-}
-
-stock PickBestFrames( const a, const b )
-{
-    new bool:va = ( a >= 1 && a <= 10000 );
-    new bool:vb = ( b >= 1 && b <= 10000 );
-
-    if ( va && !vb ) return a;
-    if ( vb && !va ) return b;
-
-    if ( va && vb )
-    {
-        return ( a < b ) ? a : b;
-    }
-
-    return 0;
 }
 
 stock GetModelNumSeqCached( const szModel[ ] )
@@ -2121,34 +2264,14 @@ stock bool:GetModelNumSeq( const szModel[ ], &iNumSeq )
 {
     iNumSeq = 0;
 
-    if ( !ValidateModelFile( szModel ) )
+    new iSeqIndex;
+
+    if ( !ReadStudioSequenceTable( szModel, iNumSeq, iSeqIndex ) )
     {
+        iNumSeq = 0;
         return false;
     }
 
-    new f = fopen( szModel, "rb" );
-
-    if ( !f )
-    {
-        return false;
-    }
-
-    const STUDIOHEADER_NUMSEQ = 164;
-
-    new iSeqCount, iSeqIndex;
-
-    fseek( f, STUDIOHEADER_NUMSEQ, SEEK_SET );
-    fread( f, iSeqCount, BLOCK_INT );
-    fread( f, iSeqIndex, BLOCK_INT );
-
-    fclose( f );
-
-    if ( iSeqCount <= 0 || iSeqIndex <= 0 )
-    {
-        return false;
-    }
-
-    iNumSeq = iSeqCount;
     return true;
 }
 
@@ -2187,6 +2310,52 @@ stock CleanupTrieCache( Trie:hTrie )
 // ========================================================================
 //  KEYWORD LOADING
 // ========================================================================
+stock bool:ReadCompleteConfigLine( const f, szLine[ ], const iLen )
+{
+    // AMXX reads each physical line into an internal 4096-byte C buffer
+    // before copying it to Pawn. Match that size here so a long line cannot
+    // make us consume the following valid line while discarding truncation.
+    static szRawLine[ 4096 ];
+
+    if ( !fgets( f, szRawLine, charsmax( szRawLine ) ) )
+    {
+        return false;
+    }
+
+    if ( contain( szRawLine, "^n" ) == -1 && !feof( f ) )
+    {
+        while ( fgets( f, szRawLine, charsmax( szRawLine ) ) )
+        {
+            if ( contain( szRawLine, "^n" ) != -1 || feof( f ) )
+            {
+                break;
+            }
+        }
+
+        // Reject a truncated logical line instead of parsing its fragments.
+        szLine[ 0 ] = EOS;
+        return true;
+    }
+
+    new iRawLen = strlen( szRawLine );
+
+    while ( iRawLen > 0 && ( szRawLine[ iRawLen - 1 ] == '^n' || szRawLine[ iRawLen - 1 ] == '^r' ) )
+    {
+        szRawLine[ --iRawLen ] = EOS;
+    }
+
+    if ( iRawLen > iLen )
+    {
+        // Reject the complete overlong line rather than parsing a prefix.
+        szLine[ 0 ] = EOS;
+        return true;
+    }
+
+    copy( szLine, iLen, szRawLine );
+
+    return true;
+}
+
 stock LoadInspectKeywords( )
 {
     new szConfigDir[ 128 ];
@@ -2210,12 +2379,11 @@ stock LoadInspectKeywords( )
         return;
     }
 
-    new szLine[ 64 ];
+    new szLine[ 256 ];
     new szKeyword[ KEYWORD_MAX_LEN ];
 
-    while ( !feof( f ) )
+    while ( ReadCompleteConfigLine( f, szLine, charsmax( szLine ) ) )
     {
-        fgets( f, szLine, charsmax( szLine ) );
         trim( szLine );
 
         if ( szLine[ 0 ] == EOS || szLine[ 0 ] == ';' || ( szLine[ 0 ] == '/' && szLine[ 1 ] == '/' ) )
@@ -2223,10 +2391,10 @@ stock LoadInspectKeywords( )
             continue;
         }
 
-        copy( szKeyword, charsmax( szKeyword ), szLine );
-
-        if ( strlen( szKeyword ) > 0 && strlen( szKeyword ) < KEYWORD_MAX_LEN )
+        new iKeywordLen = strlen( szLine );
+        if ( iKeywordLen > 0 && iKeywordLen < KEYWORD_MAX_LEN )
         {
+            copy( szKeyword, charsmax( szKeyword ), szLine );
             ArrayPushString( g_aInspectKeywords, szKeyword );
             g_iInspectKeywordCount++;
 
@@ -2313,9 +2481,8 @@ stock LoadModelRules( )
     new szSection[ MODEL_PATH_LEN ];
     szSection[ 0 ] = EOS;
 
-    while ( !feof( f ) )
+    while ( ReadCompleteConfigLine( f, szLine, charsmax( szLine ) ) )
     {
-        fgets( f, szLine, charsmax( szLine ) );
         trim( szLine );
 
         if ( szLine[ 0 ] == EOS || szLine[ 0 ] == ';' || ( szLine[ 0 ] == '/' && szLine[ 1 ] == '/' ) )
@@ -2399,23 +2566,25 @@ stock CreateDefaultModelRulesFile( const szPath[ ] )
 
 stock ParseIniSection( const szLine[ ], szOut[ ], const iLen )
 {
-    // expects: [ something ]
     szOut[ 0 ] = EOS;
 
     new iStart = contain( szLine, "[" );
     new iEnd   = contain( szLine, "]" );
 
-    if ( iStart == -1 || iEnd == -1 || iEnd <= iStart )
+    if ( iStart != 0 || iEnd <= iStart + 1 )
     {
         return;
     }
 
-    new szTmp[ MODEL_PATH_LEN ];
-    copy( szTmp, charsmax( szTmp ), szLine[ iStart + 1 ] );
-    szTmp[ iEnd - ( iStart + 1 ) ] = EOS;
+    new iSectionLen = iEnd - iStart - 1;
 
-    trim( szTmp );
-    copy( szOut, iLen, szTmp );
+    if ( iSectionLen > iLen )
+    {
+        return;
+    }
+
+    copy( szOut, iSectionLen, szLine[ iStart + 1 ] );
+    trim( szOut );
 }
 
 stock bool:ParseIniKeyValue( const szLine[ ], szKey[ ], const iKeyLen, szVal[ ], const iValLen )
@@ -2424,13 +2593,12 @@ stock bool:ParseIniKeyValue( const szLine[ ], szKey[ ], const iKeyLen, szVal[ ],
     szVal[ 0 ] = EOS;
 
     new iEq = contain( szLine, "=" );
-    if ( iEq == -1 )
+    if ( iEq <= 0 || iEq > iKeyLen )
     {
         return false;
     }
 
-    copy( szKey, iKeyLen, szLine );
-    szKey[ iEq ] = EOS;
+    copy( szKey, iEq, szLine );
     trim( szKey );
 
     copy( szVal, iValLen, szLine[ iEq + 1 ] );

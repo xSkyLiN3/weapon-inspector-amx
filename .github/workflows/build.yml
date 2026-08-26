@@ -23,7 +23,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Read and validate version
         id: version
@@ -35,8 +35,8 @@ jobs:
           grep -Fq "new const PLUGIN_VERSION[ ] = \"${version}\";" addons/amxmodx/scripting/weapon_inspector.sma
           echo "value=${version}" >> "$GITHUB_OUTPUT"
 
-      - name: Install 32-bit runtime and packaging tools
-        run: sudo apt-get update && sudo apt-get install --yes libc6-i386 zip
+      - name: Install 32-bit runtime
+        run: sudo apt-get update && sudo apt-get install --yes libc6-i386
 
       - name: Download verified AMX Mod X toolchain
         shell: bash
@@ -52,38 +52,58 @@ jobs:
           tar -xzf "${base}" -C .toolchain
           tar -xzf "${cstrike}" -C .toolchain
 
-      - name: Compile plugin
+      - name: Compile plugin twice
         shell: bash
         run: |
           set -euo pipefail
           compiler=".toolchain/addons/amxmodx/scripting/amxxpc"
           includes=".toolchain/addons/amxmodx/scripting/include"
-          output="dist/addons/amxmodx/plugins/weapon_inspector.amxx"
           chmod +x "$compiler"
-          mkdir -p "$(dirname "$output")"
-          LD_LIBRARY_PATH="$(dirname "$compiler")${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
-            "$compiler" addons/amxmodx/scripting/weapon_inspector.sma "-i${includes}" "-o${output}"
-          test -s "$output"
+          for build in 1 2; do
+            output="dist/build-${build}/weapon_inspector.amxx"
+            mkdir -p "$(dirname "$output")"
+            LD_LIBRARY_PATH="$(dirname "$compiler")${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+              "$compiler" addons/amxmodx/scripting/weapon_inspector.sma "-i${includes}" "-o${output}"
+            test -s "$output"
+          done
+          if ! cmp --silent dist/build-1/weapon_inspector.amxx dist/build-2/weapon_inspector.amxx; then
+            sha256sum dist/build-1/weapon_inspector.amxx dist/build-2/weapon_inspector.amxx
+            exit 1
+          fi
+          mkdir -p dist/addons/amxmodx/plugins
+          cp dist/build-1/weapon_inspector.amxx dist/addons/amxmodx/plugins/weapon_inspector.amxx
+          sha256sum dist/addons/amxmodx/plugins/weapon_inspector.amxx
 
-      - name: Assemble release package
+      - name: Assemble release package twice
         shell: bash
         run: |
           set -euo pipefail
-          package="dist/package"
-          mkdir -p "$package/addons/amxmodx/plugins" "$package/addons/amxmodx/configs" "$package/addons/amxmodx/scripting/include"
-          cp dist/addons/amxmodx/plugins/weapon_inspector.amxx "$package/addons/amxmodx/plugins/"
-          cp addons/amxmodx/configs/inspect_list.ini addons/amxmodx/configs/weapon_inspector.cfg addons/amxmodx/configs/weapon_inspector_models.ini "$package/addons/amxmodx/configs/"
-          cp addons/amxmodx/scripting/weapon_inspector.sma "$package/addons/amxmodx/scripting/"
-          cp addons/amxmodx/scripting/include/weapon_inspector.inc "$package/addons/amxmodx/scripting/include/"
-          cp README.md CHANGELOG.md LICENSE VERSION "$package/"
-          (cd "$package" && zip -9 -r "../weapon-inspector-v${{ steps.version.outputs.value }}.zip" .)
+          first="dist/weapon-inspector-first.zip"
+          second="dist/weapon-inspector-second.zip"
+          final="dist/weapon-inspector-v${{ steps.version.outputs.value }}.zip"
+          plugin="dist/addons/amxmodx/plugins/weapon_inspector.amxx"
+          python3 scripts/package_release.py --plugin "$plugin" --output "$first"
+          python3 scripts/package_release.py --plugin "$plugin" --output "$second"
+          if ! cmp --silent "$first" "$second"; then
+            sha256sum "$first" "$second"
+            exit 1
+          fi
+          mv "$first" "$final"
+          rm "$second"
+          python3 -m zipfile --test "$final"
+          python3 -m zipfile --list "$final"
+          (cd dist && sha256sum "$(basename "$final")" > SHA256SUMS.txt && sha256sum --check --strict SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: weapon-inspector-${{ steps.version.outputs.value }}
-          path: dist/weapon-inspector-v${{ steps.version.outputs.value }}.zip
+          path: |
+            dist/weapon-inspector-v${{ steps.version.outputs.value }}.zip
+            dist/SHA256SUMS.txt
           if-no-files-found: error
+          compression-level: 0
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -94,7 +114,7 @@ jobs:
 
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Validate tag
         shell: bash
@@ -103,7 +123,7 @@ jobs:
           test "${GITHUB_REF_NAME}" = "v${{ needs.build.outputs.version }}"
 
       - name: Download build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: weapon-inspector-${{ needs.build.outputs.version }}
           path: dist
@@ -116,8 +136,12 @@ jobs:
           set -euo pipefail
           notes="docs/releases/${GITHUB_REF_NAME}.md"
           asset="dist/weapon-inspector-${GITHUB_REF_NAME}.zip"
+          checksums="dist/SHA256SUMS.txt"
+          test -f "$asset"
+          test -f "$checksums"
+          (cd dist && sha256sum --check --strict SHA256SUMS.txt)
           if [[ -f "$notes" ]]; then
-            gh release create "$GITHUB_REF_NAME" "$asset" --verify-tag --title "Weapon Inspector ${GITHUB_REF_NAME}" --notes-file "$notes"
+            gh release create "$GITHUB_REF_NAME" "$asset" "$checksums" --verify-tag --title "Weapon Inspector ${GITHUB_REF_NAME}" --notes-file "$notes"
           else
-            gh release create "$GITHUB_REF_NAME" "$asset" --verify-tag --title "Weapon Inspector ${GITHUB_REF_NAME}" --generate-notes
+            gh release create "$GITHUB_REF_NAME" "$asset" "$checksums" --verify-tag --title "Weapon Inspector ${GITHUB_REF_NAME}" --generate-notes
           fi
