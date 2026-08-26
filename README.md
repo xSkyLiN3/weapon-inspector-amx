@@ -1,21 +1,21 @@
 # Weapon Inspector (AMX Mod X) 🔍
 
 [![Build](https://github.com/xSkyLiN3/weapon-inspector-amx/actions/workflows/build.yml/badge.svg)](https://github.com/xSkyLiN3/weapon-inspector-amx/actions/workflows/build.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: GPL v3+](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
 
-**Weapon Inspector** adds a clean, modern “inspect weapon” feature to **Counter-Strike 1.6** — entirely **server-side**, using **AMX Mod X** with Engine, Ham Sandwich, Fakemeta and CStrike.
+**Weapon Inspector** is a server-side AMX Mod X plugin for **Counter-Strike 1.6**. It discovers inspect-like sequences from GoldSrc model metadata instead of relying on fixed animation IDs.
 
-Players can inspect the weapon they’re holding and see the model’s **real inspect animation** (if the model has one). No client-side modifications are required.
+When a viewmodel contains a sequence whose label matches a configured keyword, the plugin can select it, calculate its duration from frame/FPS metadata and play it on request. No client plugin is required; custom models must still be delivered through the server's normal asset-download mechanism.
 
-If a model does not support inspect animations, the plugin simply **does nothing** for that model — no interference, no forced animations, no idle manipulation.
+> **Validation status:** AMX Mod X 1.10 compilation and release packaging are automated. Version 1.1.2 is undergoing private Counter-Strike 1.6 runtime validation. Runtime behavior described below is implementation intent until the validation matrix is complete.
 
 ---
 
 ## Quick Summary ✅
 
-- 🎬 Plays the real inspect animation embedded in the weapon’s viewmodel
-- 🧠 No hardcoded animation IDs
-- 🛡️ Safe behavior: cancels cleanly on shooting, switching weapons, reload, zoom, death
+- 🎬 Selects an embedded sequence whose label matches configured keywords
+- 🧠 Discovers inspect sequence IDs from model metadata
+- 🛡️ Implements cancellation paths for firing, weapon switch, reload, zoom and death
 - 🎮 Multiple activation options: Impulse or manual bind
 - ⚙️ Configurable duration clamps, cooldowns, anti-spam
 - 🧊 Model support gate (unsupported models are cached and skipped)
@@ -33,17 +33,17 @@ Weapon Inspector avoids that by:
 - Calculating duration using the model’s own frame/FPS data
 - Caching results per model path
 
-Result: **Works across many custom models without manual tuning.**
+The design targets custom GoldSrc models with compatible sequence labels. Compatibility and visual timing can vary by model.
 
 ---
 
-## What Players See 🎮
+## Expected runtime behavior 🎮
 
 When a player triggers Inspect:
 
 - The weapon plays an inspect-style animation (if available)
-- The animation completes naturally
-- Normal gameplay resumes automatically
+- The plugin keeps weapon-idle timing beyond the selected sequence duration
+- On completion or cancellation, it selects a known idle sequence when available; otherwise it returns control to the GameDLL
 
 Inspect is blocked in situations where it would break timing (zoomed, reloading, attacking, etc.).
 
@@ -57,7 +57,7 @@ Inspect is blocked in situations where it would break timing (zoomed, reloading,
 - 🎯 Scoped/zoom protection
 - 🧊 Support gate for models without inspect animations
 - ⏱️ Cooldown + busy windows (deploy/reload/fire)
-- 🧯 Safe cancellation system
+- 🧯 Explicit cancellation paths
 - 🧩 Developer API (natives + multi-forwards)
 - 🧰 Admin debug tools
 
@@ -70,7 +70,7 @@ Inspect is blocked in situations where it would break timing (zoomed, reloading,
 - Engine, Ham Sandwich, Fakemeta and CStrike modules enabled
 - A viewmodel containing an inspect-like sequence (`inspect`, `lookat`, `examine` or `check` by default)
 
-The default Counter-Strike models do not contain inspect animations. Unsupported models are detected and skipped without changing normal weapon behavior.
+The default Counter-Strike models do not contain inspect animations. Inspect activation is skipped when no matching sequence is found; negative results are cached until configuration reload or plugin/map restart. A no-interference runtime matrix is tracked in [docs/validation.md](docs/validation.md).
 
 ---
 
@@ -86,7 +86,7 @@ CVAR:
 | 1 | Impulse 100 (Flashlight key) |
 | 2 | Impulse 201 |
 
-Manual bind (always available):
+Manual command (subject to the per-model `MANUAL_INSPECT` rule):
 
     bind f "inspect"
 
@@ -219,7 +219,7 @@ The script compiles `addons/amxmodx/scripting/weapon_inspector.sma` and writes `
 | Command | Access | Description |
 |---------|--------|-------------|
 | `wi_status` | `ADMIN_RCON` | Shows plugin version and cache/configuration status |
-| `wi_reload_config` | `ADMIN_RCON` | Reloads keyword/model rules and safely rebuilds the model cache |
+| `wi_reload_config` | `ADMIN_RCON` | Reloads keyword/model rules and clears the model cache |
 | `wi_debug <player>` | `ADMIN_RCON` | Shows state, timing, model and sequence information for a player |
 
 Console access and the AMX Mod X `ADMIN_RCON` flag are accepted. Other clients are rejected by `cmd_access`.
@@ -230,7 +230,7 @@ Console access and the AMX Mod X `ADMIN_RCON` flag are accepted. Other clients a
 
 This project follows [Semantic Versioning](https://semver.org/). Patch releases contain compatible fixes, minor releases add backward-compatible functionality and major releases may change configuration or API contracts.
 
-Release tags must match the value in `VERSION` (for example, `v1.1.1`). A matching tag compiles the plugin, creates the consistently named `weapon-inspector-v1.1.1.zip` package and publishes it as a GitHub Release asset.
+Release tags must match the value in `VERSION` (for example, `v1.1.2`). A matching tag compiles the plugin, creates the consistently named `weapon-inspector-v1.1.2.zip` package and publishes it as a GitHub Release asset with a checksum.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
@@ -242,11 +242,11 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 Before any inspect logic runs:
 
-- The model file is validated (exists, size check, Studio header magic)
+- The model file is validated (size, Studio magic/version, declared length and bounded sequence table)
 - Sequences are extracted once
 - Support result is cached
 
-Unsupported models are permanently skipped.
+Negative support results are cached until configuration reload or plugin/map restart.
 
 ---
 
@@ -259,20 +259,18 @@ Duration is calculated from model data:
 Safety measures:
 
 - FPS is sanity-clamped
-- Frame count chosen via heuristic
+- Frame count is read from the GoldSrc `numframes` field
 - Final duration clamped between min/max CVARs
 
 ---
 
 ## Natural Idle Philosophy 🎞️
 
-The plugin does NOT spam idle animations.
-
-Instead, it extends:
+The plugin actively manages:
 
     m_flTimeWeaponIdle
 
-When inspect ends, the engine resumes its normal idle cycle automatically.
+During inspect, the field is written as a relative duration for CS 1.6 predicted weapon timing. After completion or cancellation, the plugin prefers a detected idle sequence and otherwise releases the timer for the GameDLL.
 
 ---
 
@@ -281,7 +279,7 @@ When inspect ends, the engine resumes its normal idle cycle automatically.
 For M4A1 and USP:
 
 - Prefers sequences tagged `_sil` or `_unsil`
-- Falls back safely if pool missing
+- Falls back from the matching silencer pool to generic and then opposite-state sequences
 - Blacklists attach/detach sequences
 
 ---
@@ -292,7 +290,7 @@ Inspect is blocked while zoomed using:
 
     cs_get_user_zoom()
 
-Prevents animation conflicts and view glitches.
+The implementation blocks inspect while zoomed and cancels an active inspect when secondary attack is used. Visual behavior remains part of the runtime validation matrix.
 
 ---
 
@@ -360,10 +358,10 @@ Forwards:
 
 ## License 📜
 
-MIT License
+GNU GPL version 3 or later. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ---
 
 ## Author 👤
 
-SkyLiN3
+Cristóbal Vergara ([xSkyLiN3](https://github.com/xSkyLiN3))
